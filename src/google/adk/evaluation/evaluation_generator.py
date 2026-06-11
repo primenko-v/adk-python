@@ -17,7 +17,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import importlib
+import json
 import logging
+import time
 from typing import Any
 from typing import AsyncGenerator
 from typing import Optional
@@ -26,12 +28,13 @@ import uuid
 from google.genai import errors
 from google.genai import types
 from google.genai.types import Content
+import opentelemetry.context as context_api
+from opentelemetry.trace import set_span_in_context
 from pydantic import BaseModel
 from websockets.exceptions import ConnectionClosed
 from websockets.exceptions import ConnectionClosedOK
 
 from ..agents.callback_context import CallbackContext
-from ..agents.invocation_context import InvocationContext
 from ..agents.live_request_queue import LiveRequestQueue
 from ..agents.llm_agent import Agent
 from ..agents.run_config import RunConfig
@@ -39,7 +42,6 @@ from ..agents.run_config import StreamingMode
 from ..artifacts.base_artifact_service import BaseArtifactService
 from ..artifacts.in_memory_artifact_service import InMemoryArtifactService
 from ..events.event import Event
-from ..flows.llm_flows.functions import handle_function_calls_live
 from ..memory.base_memory_service import BaseMemoryService
 from ..memory.in_memory_memory_service import InMemoryMemoryService
 from ..models.llm_request import LlmRequest
@@ -47,6 +49,7 @@ from ..runners import Runner
 from ..sessions.base_session_service import BaseSessionService
 from ..sessions.in_memory_session_service import InMemorySessionService
 from ..sessions.session import Session
+from ..telemetry import tracing as _telemetry
 from ..utils.context_utils import Aclosing
 from ._retry_options_utils import EnsureRetryOptionsPlugin
 from .app_details import AgentDetails
@@ -68,6 +71,14 @@ logger = logging.getLogger("google_adk." + __name__)
 
 _USER_AUTHOR = "user"
 _DEFAULT_AUTHOR = "agent"
+
+
+def _extract_content_text(content: Optional[Content]) -> Optional[str]:
+  """Joins the text parts of a `Content` into a single string, or None."""
+  if not content or not content.parts:
+    return None
+  text = " ".join(p.text for p in content.parts if p.text)
+  return text or None
 
 
 class EvalCaseResponses(BaseModel):
@@ -100,6 +111,13 @@ class _LiveSession:
     self.live_finished = asyncio.Event()
     self.current_invocation_id = Event.new_id()
     self.consume_task = None
+    # OTel context whose current span is the per-turn `live_turn`. Set by
+    # the main task before sending a user message and cleared after the
+    # turn completes. The consume task attaches it around
+    # `handle_function_calls_live` so tool spans are parented under
+    # `live_turn` (i.e. live in the same trace as their turn) instead of
+    # under whatever ambient context this task happens to have.
+    self.current_turn_context: Optional[context_api.Context] = None
 
   async def __aenter__(self) -> _LiveSession:
     """Starts the background task."""
@@ -125,6 +143,25 @@ class _LiveSession:
           self.session, self.runner.agent
       )
 
+      # Run before_agent_callback before any instruction preprocessing.
+      # `agent.run_live` (bypassed below) would normally fire this. Without it,
+      # an agent that seeds session state in before_agent_callback raises
+      # KeyError when `_preprocess_async` renders a `{state_var}` referenced by
+      # its instruction template. The callback writes through to
+      # `session.state` (State.__setitem__), and we append the resulting event
+      # so the state delta is persisted for non-in-memory session services too.
+      before_agent_event = (
+          await invocation_context.agent._handle_before_agent_callback(
+              invocation_context
+          )
+      )
+      if before_agent_event:
+        await self.runner.session_service.append_event(
+            session=self.session, event=before_agent_event
+        )
+      if invocation_context.end_invocation:
+        return
+
       callback_context = None
       llm_request = LlmRequest()
 
@@ -147,82 +184,77 @@ class _LiveSession:
       )
 
       in_function_call_loop = False
+      # Bypass `agent.run_live`: it wraps the flow in `record_agent_invocation`
+      # which opens a single long-lived `invoke_agent` span covering the
+      # entire session. That collapses every turn into one trace and adds an
+      # empty/erroring trace to session views (the WebSocket close at
+      # session-end gets recorded as a span exception). Call the impl
+      # directly; per-turn `live_turn` spans (opened by the main task) take
+      # over the role of session-grouped invocation spans for eval purposes.
+      # `before_agent_callback` is run explicitly above; `after_agent_callback`
+      # is still skipped here — fine for evals of agents that don't rely on it.
       async with Aclosing(
-          invocation_context.agent.run_live(invocation_context)
+          invocation_context.agent._run_live_impl(invocation_context)
       ) as agen:
-        async for event in agen:
-          assert event is not None
-          event.invocation_id = self.current_invocation_id
-          if callback_context:
-            await invocation_context.plugin_manager.run_after_model_callback(
-                callback_context=callback_context,
-                llm_response=event,
-            )
-          await self.event_queue.put(event)
-          if not event.partial:
-            await self.runner.session_service.append_event(
-                session=self.session, event=event
-            )
-          function_calls = event.get_function_calls()
-          if function_calls:
-            in_function_call_loop = True
-            inv_context = InvocationContext(
-                session_service=self.runner.session_service,
-                invocation_id=event.invocation_id,
-                agent=self.runner.agent,
-                session=self.session,
-                run_config=run_config,
-            )
-
-            if isinstance(self.runner.agent, Agent):
-              resolved_tools = await self.runner.agent.canonical_tools(
-                  inv_context
-              )
-              tools_dict = {t.name: t for t in resolved_tools}
-            else:
-              tools_dict = {}
-
+        # Drive the generator manually so we can attach
+        # `current_turn_context` around BOTH the generator's internal work
+        # (which also runs `handle_function_calls_live` — see
+        # base_llm_flow.py:_receive_from_model) and our own body below.
+        # Without this, the first invocation of the tool — the one inside
+        # `_run_live_impl` — runs without `live_turn` as parent and lands
+        # as an orphan root span.
+        while True:
+          token = (
+              context_api.attach(self.current_turn_context)
+              if self.current_turn_context is not None
+              else None
+          )
+          try:
             try:
-              response_event = await handle_function_calls_live(
-                  invocation_context=inv_context,
-                  function_call_event=event,
-                  tools_dict=tools_dict,
+              event = await agen.__anext__()
+            except StopAsyncIteration:
+              break
+            assert event is not None
+            event.invocation_id = self.current_invocation_id
+            if callback_context:
+              await invocation_context.plugin_manager.run_after_model_callback(
+                  callback_context=callback_context,
+                  llm_response=event,
               )
+            await self.event_queue.put(event)
+            if not event.partial:
+              await self.runner.session_service.append_event(
+                  session=self.session, event=event
+              )
+            # Track the "function-call → tool-response → final answer"
+            # interlude so the first `turn_complete` (which signals "I've
+            # issued my tool call") doesn't release the main task — the
+            # turn isn't really done until the post-tool reply arrives.
+            if event.get_function_calls():
+              in_function_call_loop = True
 
-              if (
-                  response_event
-                  and response_event.content
-                  and response_event.content.parts
-              ):
-                for part in response_event.content.parts:
-                  if part.function_response:
-                    tool_content = types.Content(
-                        role="tool",
-                        parts=[part],
-                    )
-                    self.live_request_queue.send_content(tool_content)
-            except (ValueError, RuntimeError, KeyError, TypeError) as e:
-              logger.error(
-                  "Failed to handle function calls: %s",
-                  e,
-                  exc_info=True,
-              )
-              for fc in function_calls:
-                response_content = types.FunctionResponse(
-                    name=fc.name,
-                    id=fc.id,
-                    response={"error": str(e)},
-                )
-                tool_content = types.Content(
-                    role="tool",
-                    parts=[types.Part(function_response=response_content)],
-                )
-                self.live_request_queue.send_content(tool_content)
-          if event.turn_complete and event.author != _USER_AUTHOR:
-            if not in_function_call_loop:
-              self.turn_complete_event.set()
-            else:
-              in_function_call_loop = False
+            # `_run_live_impl` (base_llm_flow.py:_receive_from_model)
+            # already runs `handle_function_calls_live` and yields the
+            # resulting function_response event. Running it again here
+            # would execute the tool twice. Just forward the response
+            # parts back into the live model.
+            if event.content and event.content.parts:
+              for part in event.content.parts:
+                if part.function_response:
+                  tool_content = types.Content(
+                      role="tool",
+                      parts=[part],
+                  )
+                  self.live_request_queue.send_content(tool_content)
+
+            if event.turn_complete and event.author != _USER_AUTHOR:
+              if not in_function_call_loop:
+                self.turn_complete_event.set()
+              else:
+                in_function_call_loop = False
+          finally:
+            if token is not None:
+              context_api.detach(token)
     finally:
       self.live_finished.set()
       self.turn_complete_event.set()  # Unblock any waiters
@@ -331,6 +363,11 @@ class EvaluationGenerator:
     return results
 
   @staticmethod
+  def _is_live_api_model(name: str) -> bool:
+    """Detects Gemini Live API models by name (e.g. `gemini-live-...`)."""
+    return "live" in name
+
+  @staticmethod
   async def _process_query(
       module_name: str,
       user_simulator: UserSimulator,
@@ -349,12 +386,23 @@ class EvaluationGenerator:
       agent_to_evaluate = root_agent.find_agent(agent_name)
       assert agent_to_evaluate, f"Sub-Agent `{agent_name}` not found."
 
-    return await EvaluationGenerator._generate_inferences_from_root_agent(
-        agent_to_evaluate,
-        user_simulator=user_simulator,
-        reset_func=reset_func,
-        initial_session=initial_session,
-    )
+    if EvaluationGenerator._is_live_api_model(agent_to_evaluate.model):
+      return (
+          await EvaluationGenerator._generate_inferences_from_root_agent_live(
+              root_agent=agent_to_evaluate,
+              user_simulator=user_simulator,
+              reset_func=reset_func,
+              initial_session=initial_session,
+          )
+      )
+
+    else:
+      return await EvaluationGenerator._generate_inferences_from_root_agent(
+          agent_to_evaluate,
+          user_simulator=user_simulator,
+          reset_func=reset_func,
+          initial_session=initial_session,
+      )
 
   @staticmethod
   async def _generate_inferences_for_single_user_invocation(
@@ -413,8 +461,21 @@ class EvaluationGenerator:
       )
       raise
 
-    while not event_queue.empty():
-      event = await event_queue.get()
+    # Server-side audio transcription is decoupled from the audio stream
+    # — `output_transcription` events can arrive after `turn_complete`.
+    # Bailing on the first `event_queue.empty()` drops those stragglers,
+    # which leaves the turn with no model reply, which makes the user
+    # simulator (correctly!) retry the same question on the next
+    # iteration. Instead, keep draining until the queue stays idle for a
+    # short settle window.
+    settle_seconds = 0.5
+    while True:
+      try:
+        event = await asyncio.wait_for(
+            event_queue.get(), timeout=settle_seconds
+        )
+      except asyncio.TimeoutError:
+        break
       if event.invocation_id == current_invocation_id:
         yield event
 
@@ -495,29 +556,73 @@ class EvaluationGenerator:
 
             logger.info("Waiting for model to complete turn %d...", turn_idx)
 
-            async for (
-                event
-            ) in EvaluationGenerator._generate_inferences_for_single_user_invocation_live(
-                live_request_queue=live_session.live_request_queue,
-                event_queue=live_session.event_queue,
-                user_message=next_user_message.user_message,
-                current_invocation_id=live_session.current_invocation_id,
-                turn_complete_event=live_session.turn_complete_event,
-                live_timeout_seconds=live_timeout_seconds,
-            ):
-              events.append(event)
-
-            turn_transcription = ""
-            for evt in events:
-              if (
-                  evt.invocation_id == live_session.current_invocation_id
-                  and evt.author != _USER_AUTHOR
-                  and evt.output_transcription
+            # Open a per-turn root span. By using an empty parent context it
+            # becomes the root of its own trace, which session-grouping
+            # tracing pipelines (e.g. MLflow Sessions) treat as one chat-turn
+            # entry. Tool calls executed during the turn are re-parented
+            # under this span by `_LiveSession._consume_events` via
+            # `current_turn_context`, so the whole turn lives in one trace.
+            live_turn_span = _telemetry.tracer.start_span(
+                "live_turn",
+                context=context_api.Context(),
+                start_time=time.time_ns(),
+            )
+            live_turn_span.set_attribute("gen_ai.conversation.id", session_id)
+            live_turn_span.set_attribute("gen_ai.agent.name", runner.agent.name)
+            live_turn_span.set_attribute("gen_ai.operation.name", "chat")
+            live_session.current_turn_context = set_span_in_context(
+                live_turn_span
+            )
+            try:
+              async for (
+                  event
+              ) in EvaluationGenerator._generate_inferences_for_single_user_invocation_live(
+                  live_request_queue=live_session.live_request_queue,
+                  event_queue=live_session.event_queue,
+                  user_message=next_user_message.user_message,
+                  current_invocation_id=live_session.current_invocation_id,
+                  turn_complete_event=live_session.turn_complete_event,
+                  live_timeout_seconds=live_timeout_seconds,
               ):
-                if not evt.partial and evt.output_transcription.text:
-                  turn_transcription = evt.output_transcription.text
-                else:
-                  turn_transcription += evt.output_transcription.text
+                events.append(event)
+
+              turn_transcription = ""
+              for evt in events:
+                if (
+                    evt.invocation_id == live_session.current_invocation_id
+                    and evt.author != _USER_AUTHOR
+                    and evt.output_transcription
+                ):
+                  if not evt.partial and evt.output_transcription.text:
+                    turn_transcription = evt.output_transcription.text
+                  else:
+                    turn_transcription += evt.output_transcription.text
+
+              user_text = _extract_content_text(next_user_message.user_message)
+              if user_text:
+                live_turn_span.set_attribute(
+                    "gcp.vertex.agent.llm_request",
+                    json.dumps({
+                        "contents": [{
+                            "role": "user",
+                            "parts": [{"text": user_text}],
+                        }],
+                    }),
+                )
+              if turn_transcription:
+                live_turn_span.set_attribute(
+                    "gcp.vertex.agent.llm_response",
+                    json.dumps({
+                        "content": {
+                            "role": "model",
+                            "parts": [{"text": turn_transcription}],
+                        },
+                    }),
+                )
+            finally:
+              live_session.current_turn_context = None
+              live_turn_span.end()
+
             if turn_transcription:
               synthetic_event = Event(
                   content=Content(
