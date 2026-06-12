@@ -51,6 +51,7 @@ from ..sessions.base_session_service import BaseSessionService
 from ..sessions.in_memory_session_service import InMemorySessionService
 from ..sessions.session import Session
 from ..telemetry import tracing as _telemetry
+from ..telemetry._token_usage import TokenUsage
 from ..utils.context_utils import Aclosing
 from ._retry_options_utils import EnsureRetryOptionsPlugin
 from .app_details import AgentDetails
@@ -102,7 +103,10 @@ def _record_live_turn_telemetry(
   `llm_response` attribute then mirrors the real "speech → tool → speech"
   order instead of fusing everything into one string. Each utterance, tool
   call and tool response is also recorded as a timestamped span event, giving
-  the span a chronological view of the turn.
+  the span a chronological view of the turn. Token usage reported by the
+  live API (one `usage_metadata` event per generation) is summed onto the
+  span using the same `gen_ai.usage.*` attributes as non-live `call_llm`
+  spans, so trace-level token aggregation keeps working.
   """
   user_text = _extract_content_text(user_message)
   if user_text:
@@ -132,9 +136,13 @@ def _record_live_turn_telemetry(
     current_text = ""
     current_start = None
 
+  usage_metadatas: list[types.GenerateContentResponseUsageMetadata] = []
+
   for evt in events:
     if evt.invocation_id != invocation_id or evt.author == _USER_AUTHOR:
       continue
+    if evt.usage_metadata:
+      usage_metadatas.append(evt.usage_metadata)
     if evt.get_function_calls():
       _close_utterance()
       for call in evt.get_function_calls():
@@ -166,6 +174,26 @@ def _record_live_turn_telemetry(
       else:
         current_text += evt.output_transcription.text
   _close_utterance()
+
+  if usage_metadatas:
+
+    def _sum_tokens(field: str) -> Optional[int]:
+      values = [
+          getattr(usage, field)
+          for usage in usage_metadatas
+          if getattr(usage, field) is not None
+      ]
+      return sum(values) if values else None
+
+    aggregated_usage = types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=_sum_tokens("prompt_token_count"),
+        candidates_token_count=_sum_tokens("candidates_token_count"),
+        thoughts_token_count=_sum_tokens("thoughts_token_count"),
+        tool_use_prompt_token_count=_sum_tokens("tool_use_prompt_token_count"),
+        cached_content_token_count=_sum_tokens("cached_content_token_count"),
+        total_token_count=_sum_tokens("total_token_count"),
+    )
+    span.set_attributes(TokenUsage(aggregated_usage).to_attributes())
 
   if utterances:
     span.set_attribute(

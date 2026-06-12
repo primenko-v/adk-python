@@ -1060,6 +1060,39 @@ class TestRecordLiveTurnTelemetry:
         == "It is sunny."
     )
 
+  def test_record_live_turn_telemetry_aggregates_token_usage(self, mocker):
+    """Usage metadata from all of the turn's events is summed onto the span."""
+    span = mocker.MagicMock()
+    events = [
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            usage_metadata=types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=100,
+                candidates_token_count=20,
+            ),
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            usage_metadata=types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=150,
+                candidates_token_count=30,
+                thoughts_token_count=5,
+                cached_content_token_count=10,
+            ),
+        ),
+    ]
+
+    _record_live_turn_telemetry(span, events, "inv1", None)
+
+    span.set_attributes.assert_called_once_with({
+        "gen_ai.usage.input_tokens": 250,
+        "gen_ai.usage.output_tokens": 55,
+        "gen_ai.usage.cache_read.input_tokens": 10,
+        "gen_ai.usage.reasoning.output_tokens": 5,
+    })
+
   def test_record_live_turn_telemetry_ignores_other_invocations(self, mocker):
     """Events from other invocations do not leak into the turn's telemetry."""
     span = mocker.MagicMock()
