@@ -191,8 +191,10 @@ class _LiveSession:
       # session-end gets recorded as a span exception). Call the impl
       # directly; per-turn `live_turn` spans (opened by the main task) take
       # over the role of session-grouped invocation spans for eval purposes.
-      # `before_agent_callback` is run explicitly above; `after_agent_callback`
-      # is still skipped here — fine for evals of agents that don't rely on it.
+      # `before_agent_callback` is run explicitly above (it must fire before
+      # `_preprocess_async`, and `run_live` would fire it a second time);
+      # `after_agent_callback` is still skipped here — fine for evals of
+      # agents that don't rely on it.
       async with Aclosing(
           invocation_context.agent._run_live_impl(invocation_context)
       ) as agen:
@@ -440,6 +442,7 @@ class EvaluationGenerator:
       current_invocation_id: str,
       turn_complete_event: asyncio.Event,
       live_timeout_seconds: int,
+      agent_name: str = _DEFAULT_AUTHOR,
   ) -> AsyncGenerator[Event, None]:
     """Generates inferences for a single user invocation in live mode."""
     yield Event(
@@ -478,6 +481,22 @@ class EvaluationGenerator:
         break
       if event.invocation_id == current_invocation_id:
         yield event
+        # Emit a synthetic text event for each transcription, preserving
+        # the order in which events are received.
+        if (
+            event.author != _USER_AUTHOR
+            and event.output_transcription
+            and event.output_transcription.text
+            and event.partial
+        ):
+          yield Event(
+              content=Content(
+                  role="model",
+                  parts=[types.Part(text=event.output_transcription.text)],
+              ),
+              author=agent_name,
+              invocation_id=current_invocation_id,
+          )
 
   @staticmethod
   async def _generate_inferences_from_root_agent_live(
@@ -583,9 +602,14 @@ class EvaluationGenerator:
                   current_invocation_id=live_session.current_invocation_id,
                   turn_complete_event=live_session.turn_complete_event,
                   live_timeout_seconds=live_timeout_seconds,
+                  agent_name=runner.agent.name,
               ):
                 events.append(event)
 
+              # Aggregate the turn's transcription only to populate the span
+              # attributes below — the synthetic text events for the eval
+              # trajectory are emitted per transcription (in arrival order)
+              # by `_generate_inferences_for_single_user_invocation_live`.
               turn_transcription = ""
               for evt in events:
                 if (
@@ -622,17 +646,6 @@ class EvaluationGenerator:
             finally:
               live_session.current_turn_context = None
               live_turn_span.end()
-
-            if turn_transcription:
-              synthetic_event = Event(
-                  content=Content(
-                      role="model",
-                      parts=[types.Part(text=turn_transcription)],
-                  ),
-                  author=runner.agent.name,
-                  invocation_id=live_session.current_invocation_id,
-              )
-              events.append(synthetic_event)
 
             if live_session.live_finished.is_set():
               logger.info("Live session finished signal detected.")
