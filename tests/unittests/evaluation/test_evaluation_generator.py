@@ -933,6 +933,82 @@ class TestLiveSessionCallbacks:
     assert called_after_args.kwargs["llm_response"] == mock_event
 
 
+class TestLiveSessionFunctionResponses:
+  """_LiveSession must not re-send tool responses to the live model."""
+
+  @pytest.mark.asyncio
+  async def test_consume_events_does_not_resend_function_responses(
+      self, mocker
+  ):
+    """The flow's run_live already forwards tool responses to the model.
+
+    Forwarding them again from _consume_events makes the model receive the
+    tool result twice and answer the same question twice.
+    """
+    from google.adk.agents.llm_agent import Agent
+
+    mock_runner = mocker.MagicMock()
+    mock_runner.session_service.append_event = mocker.AsyncMock()
+    mock_agent = mocker.MagicMock(spec=Agent)
+    mock_runner.agent = mock_agent
+    mock_runner._find_agent_to_run.return_value = mock_agent
+    mock_agent.name = "test_agent"
+
+    async def mock_preprocess_async(invocation_context, llm_request):
+      return
+      yield
+
+    mock_flow = mocker.MagicMock()
+    mock_flow._preprocess_async = mock_preprocess_async
+    mock_agent._llm_flow = mock_flow
+    mock_agent._handle_before_agent_callback = mocker.AsyncMock(
+        return_value=None
+    )
+
+    function_response_event = Event(
+        author="agent",
+        invocation_id="inv1",
+        content=types.Content(
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="get_temperature", response={"temp": 8.5}
+                    )
+                )
+            ]
+        ),
+    )
+
+    async def mock_run_live(*args, **kwargs):
+      yield function_response_event
+
+    mock_agent._run_live_impl.return_value = mock_run_live()
+    mock_plugin_manager = mocker.MagicMock()
+    mock_plugin_manager.run_before_model_callback = mocker.AsyncMock()
+    mock_plugin_manager.run_after_model_callback = mocker.AsyncMock()
+    mock_runner._new_invocation_context_for_live.return_value.plugin_manager = (
+        mock_plugin_manager
+    )
+    mock_runner._new_invocation_context_for_live.return_value.agent = mock_agent
+    mock_runner._new_invocation_context_for_live.return_value.end_invocation = (
+        False
+    )
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="test_user",
+        session_id="test_session",
+    )
+    send_content = mocker.patch.object(
+        live_session.live_request_queue, "send_content"
+    )
+
+    await live_session._consume_events()
+
+    send_content.assert_not_called()
+
+
 class TestRecordLiveTurnTelemetry:
   """Test cases for _record_live_turn_telemetry."""
 

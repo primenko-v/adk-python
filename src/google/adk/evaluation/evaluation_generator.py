@@ -361,19 +361,14 @@ class _LiveSession:
             if event.get_function_calls():
               in_function_call_loop = True
 
-            # `_run_live_impl` (base_llm_flow.py:_receive_from_model)
-            # already runs `handle_function_calls_live` and yields the
-            # resulting function_response event. Running it again here
-            # would execute the tool twice. Just forward the response
-            # parts back into the live model.
-            if event.content and event.content.parts:
-              for part in event.content.parts:
-                if part.function_response:
-                  tool_content = types.Content(
-                      role="tool",
-                      parts=[part],
-                  )
-                  self.live_request_queue.send_content(tool_content)
+            # The flow handles the whole tool loop by itself:
+            # `_receive_from_model` runs `handle_function_calls_live` and
+            # yields the function_response event, and `run_live`
+            # (base_llm_flow.py, "send back the function response to
+            # models") forwards it into the live request queue. Executing
+            # the tool or forwarding the response here would do either a
+            # second time — the model would receive the tool result twice
+            # and answer the same question twice.
 
             if event.turn_complete and event.author != _USER_AUTHOR:
               if not in_function_call_loop:
