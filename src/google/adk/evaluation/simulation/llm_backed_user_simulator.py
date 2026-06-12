@@ -28,6 +28,7 @@ from ...models.registry import LLMRegistry
 from ...utils.context_utils import Aclosing
 from ...utils.feature_decorator import experimental
 from .._retry_options_utils import add_default_retry_options_if_not_present
+from ..constants import TRANSCRIPTION_CHUNK_METADATA_KEY
 from ..conversation_scenarios import ConversationScenario
 from ..evaluator import Evaluator
 from .llm_backed_user_simulator_prompts import get_llm_backed_user_simulator_prompt
@@ -152,23 +153,39 @@ class LlmBackedUserSimulator(UserSimulator):
       The summarized conversation history as a string.
     """
     rewritten_dialogue = []
+    # Author of the last dialogue line, if that line came from a live-API
+    # transcription chunk. Live mode emits one synthetic text event per
+    # transcription fragment, so consecutive chunks from the same author are
+    # one utterance and get merged back into a single line.
+    prev_chunk_author = None
     for e in events:
       if not e.content or not e.content.parts:
         continue
       author = e.author
+      is_transcription_chunk = bool(
+          e.custom_metadata
+          and e.custom_metadata.get(TRANSCRIPTION_CHUNK_METADATA_KEY)
+      )
       for part in e.content.parts:
         if part.text and not part.thought:
-          rewritten_dialogue.append(f"{author}: {part.text}")
+          if is_transcription_chunk and author == prev_chunk_author:
+            # Chunks carry their own leading whitespace.
+            rewritten_dialogue[-1] += part.text
+          else:
+            rewritten_dialogue.append(f"{author}: {part.text}")
+          prev_chunk_author = author if is_transcription_chunk else None
         elif include_function_calls and part.function_call:
           rewritten_dialogue.append(
               f"{author} called tool '{part.function_call.name}' with args:"
               f" {part.function_call.args}"
           )
+          prev_chunk_author = None
         elif include_function_calls and part.function_response:
           rewritten_dialogue.append(
               f"Tool '{part.function_response.name}' returned:"
               f" {part.function_response.response}"
           )
+          prev_chunk_author = None
 
     return "\n\n".join(rewritten_dialogue)
 
@@ -276,7 +293,6 @@ class LlmBackedUserSimulator(UserSimulator):
     rewritten_dialogue = self._summarize_conversation(
         events, self._config.include_function_calls
     )
-    logger.info(rewritten_dialogue)
 
     # query the LLM for the next user message
     response, error_reason = await self._get_llm_response(rewritten_dialogue)

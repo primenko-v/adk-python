@@ -132,6 +132,70 @@ class TestHelperMethods:
     )
     assert rewritten_dialogue == expected
 
+  def test_summarize_conversation_merges_transcription_chunks(self):
+    """Consecutive same-author transcription chunks render as one line."""
+
+    def _chunk(text: str) -> Event:
+      return Event(
+          author="helpful_assistant",
+          content=types.Content(parts=[types.Part(text=text)], role="model"),
+          invocation_id="inv1",
+          custom_metadata={"transcription_chunk": True},
+      )
+
+    events = [
+        Event(
+            author="user",
+            content=types.Content(
+                parts=[types.Part(text="What's the weather in Berlin?")],
+                role="user",
+            ),
+            invocation_id="inv1",
+        ),
+        _chunk("The temperature"),
+        _chunk(" in Berlin"),
+        _chunk(" is 8.5 degrees Celsius."),
+    ]
+
+    rewritten_dialogue = LlmBackedUserSimulator._summarize_conversation(events)
+
+    expected = (
+        "user: What's the weather in Berlin?\n\n"
+        "helpful_assistant: The temperature in Berlin is 8.5 degrees Celsius."
+    )
+    assert rewritten_dialogue == expected
+
+  def test_summarize_conversation_untagged_consecutive_messages_stay_separate(
+      self,
+  ):
+    """Consecutive same-author events without the chunk tag are not merged."""
+    events = [
+        Event(
+            author="helpful_assistant",
+            content=types.Content(
+                parts=[types.Part(text="Let me look into that.")],
+                role="model",
+            ),
+            invocation_id="inv1",
+        ),
+        Event(
+            author="helpful_assistant",
+            content=types.Content(
+                parts=[types.Part(text="It is 12 degrees Celsius.")],
+                role="model",
+            ),
+            invocation_id="inv1",
+        ),
+    ]
+
+    rewritten_dialogue = LlmBackedUserSimulator._summarize_conversation(events)
+
+    expected = (
+        "helpful_assistant: Let me look into that.\n\n"
+        "helpful_assistant: It is 12 degrees Celsius."
+    )
+    assert rewritten_dialogue == expected
+
 
 async def to_async_iter(items):
   for item in items:

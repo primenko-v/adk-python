@@ -20,3 +20,9 @@ MISSING_EVAL_DEPENDENCIES_MESSAGE = (
 )
 
 DEFAULT_LIVE_TIMEOUT_SECONDS = 300
+
+# `Event.custom_metadata` key marking a synthetic text event that carries one
+# live-API transcription chunk (a fragment of an utterance, not a complete
+# message). Consumers rendering dialogue can merge consecutive events that
+# share this marker.
+TRANSCRIPTION_CHUNK_METADATA_KEY = 'transcription_chunk'

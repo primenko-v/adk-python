@@ -507,6 +507,7 @@ class TestGenerateInferencesForSingleUserInvocationLive:
     assert third_event.invocation_id == invocation_id
     assert third_event.content.role == "model"
     assert third_event.content.parts[0].text == "Partial transcription"
+    assert third_event.custom_metadata == {"transcription_chunk": True}
 
     # The generator should be exhausted now
     with pytest.raises(StopAsyncIteration):

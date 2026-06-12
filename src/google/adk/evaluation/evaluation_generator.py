@@ -55,6 +55,7 @@ from ._retry_options_utils import EnsureRetryOptionsPlugin
 from .app_details import AgentDetails
 from .app_details import AppDetails
 from .constants import DEFAULT_LIVE_TIMEOUT_SECONDS
+from .constants import TRANSCRIPTION_CHUNK_METADATA_KEY
 from .eval_case import EvalCase
 from .eval_case import Invocation
 from .eval_case import InvocationEvent
@@ -496,6 +497,7 @@ class EvaluationGenerator:
               ),
               author=agent_name,
               invocation_id=current_invocation_id,
+              custom_metadata={TRANSCRIPTION_CHUNK_METADATA_KEY: True},
           )
 
   @staticmethod
