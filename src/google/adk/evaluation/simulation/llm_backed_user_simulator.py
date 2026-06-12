@@ -174,17 +174,21 @@ class LlmBackedUserSimulator(UserSimulator):
           else:
             rewritten_dialogue.append(f"{author}: {part.text}")
           prev_chunk_author = author if is_transcription_chunk else None
-        elif include_function_calls and part.function_call:
-          rewritten_dialogue.append(
-              f"{author} called tool '{part.function_call.name}' with args:"
-              f" {part.function_call.args}"
-          )
+        elif part.function_call:
+          if include_function_calls:
+            rewritten_dialogue.append(
+                f"{author} called tool '{part.function_call.name}' with args:"
+                f" {part.function_call.args}"
+            )
+          # A tool call ends the current utterance even when it isn't
+          # rendered; chunks on either side of it are separate utterances.
           prev_chunk_author = None
-        elif include_function_calls and part.function_response:
-          rewritten_dialogue.append(
-              f"Tool '{part.function_response.name}' returned:"
-              f" {part.function_response.response}"
-          )
+        elif part.function_response:
+          if include_function_calls:
+            rewritten_dialogue.append(
+                f"Tool '{part.function_response.name}' returned:"
+                f" {part.function_response.response}"
+            )
           prev_chunk_author = None
 
     return "\n\n".join(rewritten_dialogue)

@@ -165,6 +165,44 @@ class TestHelperMethods:
     )
     assert rewritten_dialogue == expected
 
+  def test_summarize_conversation_chunks_split_by_hidden_tool_call(self):
+    """Chunks separated by an unrendered tool call are not merged."""
+
+    def _chunk(text: str) -> Event:
+      return Event(
+          author="helpful_assistant",
+          content=types.Content(parts=[types.Part(text=text)], role="model"),
+          invocation_id="inv1",
+          custom_metadata={"transcription_chunk": True},
+      )
+
+    events = [
+        _chunk("Let me check"),
+        Event(
+            author="helpful_assistant",
+            content=types.Content(
+                parts=[
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="get_temperature", args={"city": "berlin"}
+                        )
+                    )
+                ],
+                role="model",
+            ),
+            invocation_id="inv1",
+        ),
+        _chunk("The temperature in Berlin is 8.5 degrees Celsius."),
+    ]
+
+    rewritten_dialogue = LlmBackedUserSimulator._summarize_conversation(events)
+
+    expected = (
+        "helpful_assistant: Let me check\n\n"
+        "helpful_assistant: The temperature in Berlin is 8.5 degrees Celsius."
+    )
+    assert rewritten_dialogue == expected
+
   def test_summarize_conversation_untagged_consecutive_messages_stay_separate(
       self,
   ):

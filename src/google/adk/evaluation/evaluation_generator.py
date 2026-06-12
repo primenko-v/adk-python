@@ -30,6 +30,7 @@ from google.genai import types
 from google.genai.types import Content
 import opentelemetry.context as context_api
 from opentelemetry.trace import set_span_in_context
+from opentelemetry.trace import Span
 from pydantic import BaseModel
 from websockets.exceptions import ConnectionClosed
 from websockets.exceptions import ConnectionClosedOK
@@ -73,6 +74,12 @@ logger = logging.getLogger("google_adk." + __name__)
 _USER_AUTHOR = "user"
 _DEFAULT_AUTHOR = "agent"
 
+# Idle window for draining a turn's events. `turn_complete` only marks the
+# end of generation; audio and its (server-side, decoupled) transcription can
+# keep arriving for seconds afterwards. Any received event resets the window,
+# so it only needs to outlast the gaps between events, not the whole tail.
+_TRANSCRIPTION_TAIL_GRACE_SECONDS = 2.0
+
 
 def _extract_content_text(content: Optional[Content]) -> Optional[str]:
   """Joins the text parts of a `Content` into a single string, or None."""
@@ -80,6 +87,96 @@ def _extract_content_text(content: Optional[Content]) -> Optional[str]:
     return None
   text = " ".join(p.text for p in content.parts if p.text)
   return text or None
+
+
+def _record_live_turn_telemetry(
+    span: Span,
+    events: list[Event],
+    invocation_id: str,
+    user_message: Optional[Content],
+) -> None:
+  """Records the turn's request/response and chronology on a `live_turn` span.
+
+  The model may speak both before and after a tool call within one turn, so
+  transcription chunks are stitched into one utterance per such segment: the
+  `llm_response` attribute then mirrors the real "speech → tool → speech"
+  order instead of fusing everything into one string. Each utterance, tool
+  call and tool response is also recorded as a timestamped span event, giving
+  the span a chronological view of the turn.
+  """
+  user_text = _extract_content_text(user_message)
+  if user_text:
+    span.set_attribute(
+        "gcp.vertex.agent.llm_request",
+        json.dumps({
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": user_text}],
+            }],
+        }),
+    )
+
+  utterances: list[str] = []
+  current_text = ""
+  current_start: Optional[float] = None
+
+  def _close_utterance() -> None:
+    nonlocal current_text, current_start
+    if current_text:
+      utterances.append(current_text)
+      span.add_event(
+          "model_utterance",
+          attributes={"text": current_text},
+          timestamp=int(current_start * 1e9),
+      )
+    current_text = ""
+    current_start = None
+
+  for evt in events:
+    if evt.invocation_id != invocation_id or evt.author == _USER_AUTHOR:
+      continue
+    if evt.get_function_calls():
+      _close_utterance()
+      for call in evt.get_function_calls():
+        span.add_event(
+            "tool_call",
+            attributes={
+                "tool": call.name or "",
+                "args": json.dumps(call.args, default=str),
+            },
+            timestamp=int(evt.timestamp * 1e9),
+        )
+    elif evt.get_function_responses():
+      for response in evt.get_function_responses():
+        span.add_event(
+            "tool_response",
+            attributes={
+                "tool": response.name or "",
+                "response": json.dumps(response.response, default=str),
+            },
+            timestamp=int(evt.timestamp * 1e9),
+        )
+    elif evt.output_transcription and evt.output_transcription.text:
+      if current_start is None:
+        current_start = evt.timestamp
+      if not evt.partial:
+        # A non-partial transcription carries the authoritative full text
+        # of the current utterance.
+        current_text = evt.output_transcription.text
+      else:
+        current_text += evt.output_transcription.text
+  _close_utterance()
+
+  if utterances:
+    span.set_attribute(
+        "gcp.vertex.agent.llm_response",
+        json.dumps({
+            "content": {
+                "role": "model",
+                "parts": [{"text": text} for text in utterances],
+            },
+        }),
+    )
 
 
 class EvalCaseResponses(BaseModel):
@@ -465,40 +562,45 @@ class EvaluationGenerator:
       )
       raise
 
-    # Server-side audio transcription is decoupled from the audio stream
-    # — `output_transcription` events can arrive after `turn_complete`.
-    # Bailing on the first `event_queue.empty()` drops those stragglers,
-    # which leaves the turn with no model reply, which makes the user
-    # simulator (correctly!) retry the same question on the next
-    # iteration. Instead, keep draining until the queue stays idle for a
-    # short settle window.
-    settle_seconds = 0.5
+    # Server-side audio transcription is decoupled from the audio stream:
+    # `turn_complete` only marks the end of generation, and the
+    # `output_transcription` events can trail it by seconds (the connection
+    # flushes whatever fragment it has accumulated when the turn signal
+    # arrives, so even a finished=True transcription seen here may be
+    # incomplete). Each received event resets the idle window, so a flowing
+    # tail keeps the drain alive; the window only has to outlast the gaps.
     while True:
       try:
         event = await asyncio.wait_for(
-            event_queue.get(), timeout=settle_seconds
+            event_queue.get(), timeout=_TRANSCRIPTION_TAIL_GRACE_SECONDS
         )
       except asyncio.TimeoutError:
         break
-      if event.invocation_id == current_invocation_id:
-        yield event
-        # Emit a synthetic text event for each transcription, preserving
-        # the order in which events are received.
-        if (
-            event.author != _USER_AUTHOR
-            and event.output_transcription
-            and event.output_transcription.text
-            and event.partial
-        ):
-          yield Event(
-              content=Content(
-                  role="model",
-                  parts=[types.Part(text=event.output_transcription.text)],
-              ),
-              author=agent_name,
-              invocation_id=current_invocation_id,
-              custom_metadata={TRANSCRIPTION_CHUNK_METADATA_KEY: True},
-          )
+      if event.invocation_id != current_invocation_id:
+        logger.debug(
+            "Dropped straggler event from invocation %s while draining %s.",
+            event.invocation_id,
+            current_invocation_id,
+        )
+        continue
+      yield event
+      # Emit a synthetic text event for each transcription, preserving
+      # the order in which events are received.
+      if (
+          event.author != _USER_AUTHOR
+          and event.output_transcription
+          and event.output_transcription.text
+          and event.partial
+      ):
+        yield Event(
+            content=Content(
+                role="model",
+                parts=[types.Part(text=event.output_transcription.text)],
+            ),
+            author=agent_name,
+            invocation_id=current_invocation_id,
+            custom_metadata={TRANSCRIPTION_CHUNK_METADATA_KEY: True},
+        )
 
   @staticmethod
   async def _generate_inferences_from_root_agent_live(
@@ -608,43 +710,16 @@ class EvaluationGenerator:
               ):
                 events.append(event)
 
-              # Aggregate the turn's transcription only to populate the span
-              # attributes below — the synthetic text events for the eval
-              # trajectory are emitted per transcription (in arrival order)
-              # by `_generate_inferences_for_single_user_invocation_live`.
-              turn_transcription = ""
-              for evt in events:
-                if (
-                    evt.invocation_id == live_session.current_invocation_id
-                    and evt.author != _USER_AUTHOR
-                    and evt.output_transcription
-                ):
-                  if not evt.partial and evt.output_transcription.text:
-                    turn_transcription = evt.output_transcription.text
-                  else:
-                    turn_transcription += evt.output_transcription.text
-
-              user_text = _extract_content_text(next_user_message.user_message)
-              if user_text:
-                live_turn_span.set_attribute(
-                    "gcp.vertex.agent.llm_request",
-                    json.dumps({
-                        "contents": [{
-                            "role": "user",
-                            "parts": [{"text": user_text}],
-                        }],
-                    }),
-                )
-              if turn_transcription:
-                live_turn_span.set_attribute(
-                    "gcp.vertex.agent.llm_response",
-                    json.dumps({
-                        "content": {
-                            "role": "model",
-                            "parts": [{"text": turn_transcription}],
-                        },
-                    }),
-                )
+              # The synthetic text events for the eval trajectory are emitted
+              # per transcription chunk (in arrival order) by
+              # `_generate_inferences_for_single_user_invocation_live`; the
+              # span gets per-utterance attributes and timestamped events.
+              _record_live_turn_telemetry(
+                  live_turn_span,
+                  events,
+                  live_session.current_invocation_id,
+                  next_user_message.user_message,
+              )
             finally:
               live_session.current_turn_context = None
               live_turn_span.end()

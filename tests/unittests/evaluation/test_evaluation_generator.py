@@ -15,12 +15,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from google.adk.evaluation.app_details import AgentDetails
 from google.adk.evaluation.app_details import AppDetails
 from google.adk.evaluation.eval_case import EvalCase
 from google.adk.evaluation.eval_set import EvalSet
 from google.adk.evaluation.evaluation_generator import _LiveSession
+from google.adk.evaluation.evaluation_generator import _record_live_turn_telemetry
 from google.adk.evaluation.evaluation_generator import EvaluationGenerator
 from google.adk.evaluation.request_intercepter_plugin import _RequestIntercepterPlugin
 from google.adk.evaluation.simulation.llm_backed_user_simulator import LlmBackedUserSimulatorConfig
@@ -513,6 +515,59 @@ class TestGenerateInferencesForSingleUserInvocationLive:
     with pytest.raises(StopAsyncIteration):
       await gen.__anext__()
 
+  @pytest.mark.asyncio
+  async def test_generate_inferences_live_waits_for_transcription_tail(
+      self, mocker
+  ):
+    """The drain captures an ASR tail that trails turn_complete by ~1s."""
+    mock_live_request_queue = mocker.MagicMock()
+    event_queue = asyncio.Queue()
+    turn_complete_event = asyncio.Event()
+    invocation_id = "inv1"
+
+    flushed_fragment = Event(
+        author="agent",
+        invocation_id=invocation_id,
+        partial=False,
+        output_transcription=types.Transcription(
+            text="I can provide weather for", finished=True
+        ),
+    )
+    tail_chunk = Event(
+        author="agent",
+        invocation_id=invocation_id,
+        partial=True,
+        output_transcription=types.Transcription(
+            text=" London and Berlin.", finished=False
+        ),
+    )
+
+    await event_queue.put(flushed_fragment)
+    turn_complete_event.set()
+
+    async def put_tail_late():
+      await asyncio.sleep(0.8)
+      await event_queue.put(tail_chunk)
+
+    tail_task = asyncio.create_task(put_tail_late())
+
+    gen = EvaluationGenerator._generate_inferences_for_single_user_invocation_live(
+        live_request_queue=mock_live_request_queue,
+        event_queue=event_queue,
+        user_message=types.Content(parts=[types.Part(text="Which cities?")]),
+        current_invocation_id=invocation_id,
+        turn_complete_event=turn_complete_event,
+        live_timeout_seconds=300,
+    )
+
+    async def collect():
+      return [event async for event in gen]
+
+    events = await collect()
+    await tail_task
+
+    assert tail_chunk in events
+
 
 @pytest.fixture
 def mock_runner(mocker):
@@ -876,6 +931,166 @@ class TestLiveSessionCallbacks:
     )
     assert isinstance(called_after_args.kwargs["llm_response"], Event)
     assert called_after_args.kwargs["llm_response"] == mock_event
+
+
+class TestRecordLiveTurnTelemetry:
+  """Test cases for _record_live_turn_telemetry."""
+
+  def test_record_live_turn_telemetry_splits_utterances_at_tool_calls(
+      self, mocker
+  ):
+    """Speech before and after a tool call is recorded in real order."""
+    span = mocker.MagicMock()
+    events = [
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            partial=True,
+            output_transcription=types.Transcription(text="Let me check"),
+            timestamp=1.0,
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            content=types.Content(
+                parts=[
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="get_temperature", args={"city": "berlin"}
+                        )
+                    )
+                ]
+            ),
+            timestamp=2.0,
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            content=types.Content(
+                parts=[
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name="get_temperature", response={"temp": 8.5}
+                        )
+                    )
+                ]
+            ),
+            timestamp=3.0,
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            partial=True,
+            output_transcription=types.Transcription(
+                text="The temperature in Berlin is 8.5 degrees Celsius."
+            ),
+            timestamp=4.0,
+        ),
+    ]
+
+    _record_live_turn_telemetry(
+        span,
+        events,
+        "inv1",
+        types.Content(
+            parts=[types.Part(text="What's the temperature in Berlin?")]
+        ),
+    )
+
+    span_event_names = [c.args[0] for c in span.add_event.call_args_list]
+    assert span_event_names == [
+        "model_utterance",
+        "tool_call",
+        "tool_response",
+        "model_utterance",
+    ]
+
+    attributes = {
+        c.args[0]: c.args[1] for c in span.set_attribute.call_args_list
+    }
+    assert json.loads(attributes["gcp.vertex.agent.llm_response"]) == {
+        "content": {
+            "role": "model",
+            "parts": [
+                {"text": "Let me check"},
+                {"text": "The temperature in Berlin is 8.5 degrees Celsius."},
+            ],
+        },
+    }
+
+  def test_record_live_turn_telemetry_ignores_audio_events(self, mocker):
+    """Audio events do not produce span events or break an utterance."""
+    span = mocker.MagicMock()
+    audio_event = Event(
+        author="agent",
+        invocation_id="inv1",
+        content=types.Content(
+            parts=[
+                types.Part(
+                    inline_data=types.Blob(data=b"pcm", mime_type="audio/pcm")
+                )
+            ]
+        ),
+        timestamp=1.5,
+    )
+    events = [
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            partial=True,
+            output_transcription=types.Transcription(text="It is"),
+            timestamp=1.0,
+        ),
+        audio_event,
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            partial=True,
+            output_transcription=types.Transcription(text=" sunny."),
+            timestamp=2.0,
+        ),
+    ]
+
+    _record_live_turn_telemetry(span, events, "inv1", None)
+
+    span_event_names = [c.args[0] for c in span.add_event.call_args_list]
+    assert span_event_names == ["model_utterance"]
+    assert (
+        span.add_event.call_args_list[0].kwargs["attributes"]["text"]
+        == "It is sunny."
+    )
+
+  def test_record_live_turn_telemetry_ignores_other_invocations(self, mocker):
+    """Events from other invocations do not leak into the turn's telemetry."""
+    span = mocker.MagicMock()
+    events = [
+        Event(
+            author="agent",
+            invocation_id="other_inv",
+            partial=True,
+            output_transcription=types.Transcription(text="Old turn text."),
+            timestamp=1.0,
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            partial=True,
+            output_transcription=types.Transcription(text="New turn text."),
+            timestamp=2.0,
+        ),
+    ]
+
+    _record_live_turn_telemetry(span, events, "inv1", None)
+
+    attributes = {
+        c.args[0]: c.args[1] for c in span.set_attribute.call_args_list
+    }
+    assert json.loads(attributes["gcp.vertex.agent.llm_response"]) == {
+        "content": {
+            "role": "model",
+            "parts": [{"text": "New turn text."}],
+        },
+    }
 
 
 class TestGenerateResponses:
