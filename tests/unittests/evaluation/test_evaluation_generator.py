@@ -468,13 +468,21 @@ class TestGenerateInferencesForSingleUserInvocationLive:
     user_content = types.Content(parts=[types.Part(text="User query")])
     invocation_id = "inv1"
 
-    transcription = types.Transcription(text="Partial transcription")
     partial_event = Event(
         author="agent",
         content=types.Content(parts=[]),
         invocation_id=invocation_id,
-        output_transcription=transcription,
+        output_transcription=types.Transcription(text="Partial "),
         partial=True,
+    )
+    consolidated_event = Event(
+        author="agent",
+        content=types.Content(parts=[]),
+        invocation_id=invocation_id,
+        output_transcription=types.Transcription(
+            text="Partial transcription", finished=True
+        ),
+        partial=False,
     )
 
     gen = EvaluationGenerator._generate_inferences_for_single_user_invocation_live(
@@ -496,20 +504,22 @@ class TestGenerateInferencesForSingleUserInvocationLive:
     # Mock turn_complete_event.wait to avoid blocking
     turn_complete_event.wait = mocker.AsyncMock()
 
-    # Put the partial event in the queue
     await event_queue.put(partial_event)
+    await event_queue.put(consolidated_event)
 
-    # Now advance
+    # Partial events are passed through without a synthetic companion.
     second_event = await gen.__anext__()
     assert second_event == partial_event
 
-    # Next should be the synthetic event
     third_event = await gen.__anext__()
-    assert third_event.author == "custom_agent_name"
-    assert third_event.invocation_id == invocation_id
-    assert third_event.content.role == "model"
-    assert third_event.content.parts[0].text == "Partial transcription"
-    assert third_event.custom_metadata == {"transcription_chunk": True}
+    assert third_event == consolidated_event
+
+    # The consolidated transcription yields one synthetic text event.
+    fourth_event = await gen.__anext__()
+    assert fourth_event.author == "custom_agent_name"
+    assert fourth_event.invocation_id == invocation_id
+    assert fourth_event.content.role == "model"
+    assert fourth_event.content.parts[0].text == "Partial transcription"
 
     # The generator should be exhausted now
     with pytest.raises(StopAsyncIteration):
@@ -567,6 +577,60 @@ class TestGenerateInferencesForSingleUserInvocationLive:
     await tail_task
 
     assert tail_chunk in events
+
+  @pytest.mark.asyncio
+  async def test_generate_inferences_live_stops_without_idle_wait(self, mocker):
+    """A server-sent finished + final turn_complete ends the drain at once."""
+    mock_live_request_queue = mocker.MagicMock()
+    event_queue = asyncio.Queue()
+    turn_complete_event = asyncio.Event()
+    invocation_id = "inv1"
+
+    chunk = Event(
+        author="agent",
+        invocation_id=invocation_id,
+        partial=True,
+        output_transcription=types.Transcription(
+            text="It is sunny.", finished=False
+        ),
+    )
+    server_finished = Event(
+        author="agent",
+        invocation_id=invocation_id,
+        partial=False,
+        output_transcription=types.Transcription(
+            text="It is sunny.", finished=True
+        ),
+    )
+    final_turn_complete = Event(
+        author="agent",
+        invocation_id=invocation_id,
+        turn_complete=True,
+        custom_metadata={"final_turn_complete": True},
+    )
+
+    await event_queue.put(chunk)
+    await event_queue.put(server_finished)
+    await event_queue.put(final_turn_complete)
+    turn_complete_event.set()
+
+    gen = EvaluationGenerator._generate_inferences_for_single_user_invocation_live(
+        live_request_queue=mock_live_request_queue,
+        event_queue=event_queue,
+        user_message=types.Content(parts=[types.Part(text="Weather?")]),
+        current_invocation_id=invocation_id,
+        turn_complete_event=turn_complete_event,
+        live_timeout_seconds=300,
+    )
+
+    async def collect():
+      return [event async for event in gen]
+
+    # Must finish well under the grace window — no idle wait.
+    events = await asyncio.wait_for(collect(), timeout=1.0)
+
+    assert server_finished in events
+    assert final_turn_complete in events
 
 
 @pytest.fixture
@@ -1008,6 +1072,80 @@ class TestLiveSessionFunctionResponses:
 
     send_content.assert_not_called()
 
+  @pytest.mark.asyncio
+  async def test_consume_events_tags_only_final_turn_complete(self, mocker):
+    """The post-tool turn_complete gets tagged; the intermediate one not."""
+    from google.adk.agents.llm_agent import Agent
+
+    mock_runner = mocker.MagicMock()
+    mock_runner.session_service.append_event = mocker.AsyncMock()
+    mock_agent = mocker.MagicMock(spec=Agent)
+    mock_runner.agent = mock_agent
+    mock_runner._find_agent_to_run.return_value = mock_agent
+    mock_agent.name = "test_agent"
+
+    async def mock_preprocess_async(invocation_context, llm_request):
+      return
+      yield
+
+    mock_flow = mocker.MagicMock()
+    mock_flow._preprocess_async = mock_preprocess_async
+    mock_agent._llm_flow = mock_flow
+    mock_agent._handle_before_agent_callback = mocker.AsyncMock(
+        return_value=None
+    )
+
+    function_call_event = Event(
+        author="agent",
+        invocation_id="inv1",
+        content=types.Content(
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="get_temperature", args={}
+                    )
+                )
+            ]
+        ),
+    )
+    intermediate_turn_complete = Event(
+        author="agent", invocation_id="inv1", turn_complete=True
+    )
+    final_turn_complete = Event(
+        author="agent", invocation_id="inv1", turn_complete=True
+    )
+
+    async def mock_run_live(*args, **kwargs):
+      yield function_call_event
+      yield intermediate_turn_complete
+      yield final_turn_complete
+
+    mock_agent._run_live_impl.return_value = mock_run_live()
+    mock_plugin_manager = mocker.MagicMock()
+    mock_plugin_manager.run_before_model_callback = mocker.AsyncMock()
+    mock_plugin_manager.run_after_model_callback = mocker.AsyncMock()
+    mock_runner._new_invocation_context_for_live.return_value.plugin_manager = (
+        mock_plugin_manager
+    )
+    mock_runner._new_invocation_context_for_live.return_value.agent = mock_agent
+    mock_runner._new_invocation_context_for_live.return_value.end_invocation = (
+        False
+    )
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="test_user",
+        session_id="test_session",
+    )
+
+    await live_session._consume_events()
+
+    assert not (intermediate_turn_complete.custom_metadata or {}).get(
+        "final_turn_complete"
+    )
+    assert final_turn_complete.custom_metadata == {"final_turn_complete": True}
+
 
 class TestRecordLiveTurnTelemetry:
   """Test cases for _record_live_turn_telemetry."""
@@ -1021,8 +1159,10 @@ class TestRecordLiveTurnTelemetry:
         Event(
             author="agent",
             invocation_id="inv1",
-            partial=True,
-            output_transcription=types.Transcription(text="Let me check"),
+            partial=False,
+            output_transcription=types.Transcription(
+                text="Let me check", finished=True
+            ),
             timestamp=1.0,
         ),
         Event(
@@ -1056,9 +1196,10 @@ class TestRecordLiveTurnTelemetry:
         Event(
             author="agent",
             invocation_id="inv1",
-            partial=True,
+            partial=False,
             output_transcription=types.Transcription(
-                text="The temperature in Berlin is 8.5 degrees Celsius."
+                text="The temperature in Berlin is 8.5 degrees Celsius.",
+                finished=True,
             ),
             timestamp=4.0,
         ),
@@ -1094,21 +1235,11 @@ class TestRecordLiveTurnTelemetry:
         },
     }
 
-  def test_record_live_turn_telemetry_ignores_audio_events(self, mocker):
-    """Audio events do not produce span events or break an utterance."""
+  def test_record_live_turn_telemetry_ignores_audio_and_partial_events(
+      self, mocker
+  ):
+    """Only consolidated transcriptions produce utterances."""
     span = mocker.MagicMock()
-    audio_event = Event(
-        author="agent",
-        invocation_id="inv1",
-        content=types.Content(
-            parts=[
-                types.Part(
-                    inline_data=types.Blob(data=b"pcm", mime_type="audio/pcm")
-                )
-            ]
-        ),
-        timestamp=1.5,
-    )
     events = [
         Event(
             author="agent",
@@ -1117,12 +1248,27 @@ class TestRecordLiveTurnTelemetry:
             output_transcription=types.Transcription(text="It is"),
             timestamp=1.0,
         ),
-        audio_event,
         Event(
             author="agent",
             invocation_id="inv1",
-            partial=True,
-            output_transcription=types.Transcription(text=" sunny."),
+            content=types.Content(
+                parts=[
+                    types.Part(
+                        inline_data=types.Blob(
+                            data=b"pcm", mime_type="audio/pcm"
+                        )
+                    )
+                ]
+            ),
+            timestamp=1.5,
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            partial=False,
+            output_transcription=types.Transcription(
+                text="It is sunny.", finished=True
+            ),
             timestamp=2.0,
         ),
     ]
@@ -1176,15 +1322,19 @@ class TestRecordLiveTurnTelemetry:
         Event(
             author="agent",
             invocation_id="other_inv",
-            partial=True,
-            output_transcription=types.Transcription(text="Old turn text."),
+            partial=False,
+            output_transcription=types.Transcription(
+                text="Old turn text.", finished=True
+            ),
             timestamp=1.0,
         ),
         Event(
             author="agent",
             invocation_id="inv1",
-            partial=True,
-            output_transcription=types.Transcription(text="New turn text."),
+            partial=False,
+            output_transcription=types.Transcription(
+                text="New turn text.", finished=True
+            ),
             timestamp=2.0,
         ),
     ]

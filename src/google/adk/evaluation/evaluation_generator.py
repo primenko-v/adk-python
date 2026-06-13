@@ -57,7 +57,6 @@ from ._retry_options_utils import EnsureRetryOptionsPlugin
 from .app_details import AgentDetails
 from .app_details import AppDetails
 from .constants import DEFAULT_LIVE_TIMEOUT_SECONDS
-from .constants import TRANSCRIPTION_CHUNK_METADATA_KEY
 from .eval_case import EvalCase
 from .eval_case import Invocation
 from .eval_case import InvocationEvent
@@ -75,11 +74,13 @@ logger = logging.getLogger("google_adk." + __name__)
 _USER_AUTHOR = "user"
 _DEFAULT_AUTHOR = "agent"
 
-# Idle window for draining a turn's events. `turn_complete` only marks the
-# end of generation; audio and its (server-side, decoupled) transcription can
-# keep arriving for seconds afterwards. Any received event resets the window,
-# so it only needs to outlast the gaps between events, not the whole tail.
+# Fallback idle window for draining a turn's events when no finished=True
+# transcription arrives. Each received event resets the window.
 _TRANSCRIPTION_TAIL_GRACE_SECONDS = 2.0
+
+# `Event.custom_metadata` key marking the turn-final `turn_complete` (as
+# opposed to the intermediate one emitted when the model issues a tool call).
+_FINAL_TURN_COMPLETE_METADATA_KEY = "final_turn_complete"
 
 
 def _extract_content_text(content: Optional[Content]) -> Optional[str]:
@@ -98,15 +99,12 @@ def _record_live_turn_telemetry(
 ) -> None:
   """Records the turn's request/response and chronology on a `live_turn` span.
 
-  The model may speak both before and after a tool call within one turn, so
-  transcription chunks are stitched into one utterance per such segment: the
-  `llm_response` attribute then mirrors the real "speech → tool → speech"
-  order instead of fusing everything into one string. Each utterance, tool
-  call and tool response is also recorded as a timestamped span event, giving
-  the span a chronological view of the turn. Token usage reported by the
-  live API (one `usage_metadata` event per generation) is summed onto the
-  span using the same `gen_ai.usage.*` attributes as non-live `call_llm`
-  spans, so trace-level token aggregation keeps working.
+  Utterances are the connection's consolidated (non-partial) transcriptions,
+  one per speech segment between tool calls. `llm_response` carries one part
+  per utterance, and each utterance / tool call / tool response is also
+  recorded as a timestamped span event. Token usage reported by the live API
+  (one `usage_metadata` event per generation) is summed onto the span using
+  the same `gen_ai.usage.*` attributes as non-live `call_llm` spans.
   """
   user_text = _extract_content_text(user_message)
   if user_text:
@@ -121,21 +119,6 @@ def _record_live_turn_telemetry(
     )
 
   utterances: list[str] = []
-  current_text = ""
-  current_start: Optional[float] = None
-
-  def _close_utterance() -> None:
-    nonlocal current_text, current_start
-    if current_text:
-      utterances.append(current_text)
-      span.add_event(
-          "model_utterance",
-          attributes={"text": current_text},
-          timestamp=int(current_start * 1e9),
-      )
-    current_text = ""
-    current_start = None
-
   usage_metadatas: list[types.GenerateContentResponseUsageMetadata] = []
 
   for evt in events:
@@ -144,7 +127,6 @@ def _record_live_turn_telemetry(
     if evt.usage_metadata:
       usage_metadatas.append(evt.usage_metadata)
     if evt.get_function_calls():
-      _close_utterance()
       for call in evt.get_function_calls():
         span.add_event(
             "tool_call",
@@ -164,16 +146,17 @@ def _record_live_turn_telemetry(
             },
             timestamp=int(evt.timestamp * 1e9),
         )
-    elif evt.output_transcription and evt.output_transcription.text:
-      if current_start is None:
-        current_start = evt.timestamp
-      if not evt.partial:
-        # A non-partial transcription carries the authoritative full text
-        # of the current utterance.
-        current_text = evt.output_transcription.text
-      else:
-        current_text += evt.output_transcription.text
-  _close_utterance()
+    elif (
+        evt.output_transcription
+        and evt.output_transcription.text
+        and not evt.partial
+    ):
+      utterances.append(evt.output_transcription.text)
+      span.add_event(
+          "model_utterance",
+          attributes={"text": evt.output_transcription.text},
+          timestamp=int(evt.timestamp * 1e9),
+      )
 
   if usage_metadatas:
 
@@ -349,6 +332,17 @@ class _LiveSession:
                   callback_context=callback_context,
                   llm_response=event,
               )
+            # Tag the turn-final `turn_complete` before queueing so the
+            # drain can recognize the end of the turn.
+            if (
+                event.turn_complete
+                and event.author != _USER_AUTHOR
+                and not in_function_call_loop
+            ):
+              event.custom_metadata = {
+                  **(event.custom_metadata or {}),
+                  _FINAL_TURN_COMPLETE_METADATA_KEY: True,
+              }
             await self.event_queue.put(event)
             if not event.partial:
               await self.runner.session_service.append_event(
@@ -585,13 +579,12 @@ class EvaluationGenerator:
       )
       raise
 
-    # Server-side audio transcription is decoupled from the audio stream:
-    # `turn_complete` only marks the end of generation, and the
-    # `output_transcription` events can trail it by seconds (the connection
-    # flushes whatever fragment it has accumulated when the turn signal
-    # arrives, so even a finished=True transcription seen here may be
-    # incomplete). Each received event resets the idle window, so a flowing
-    # tail keeps the drain alive; the window only has to outlast the gaps.
+    # `turn_complete` only ends generation; transcription can trail it by
+    # seconds. Stop once the turn-final `turn_complete` has been seen and
+    # the transcription closed with a finished=True consolidation (the
+    # common case — no idle wait); otherwise fall back to the grace window.
+    saw_final_turn_complete = False
+    transcription_settled = False
     while True:
       try:
         event = await asyncio.wait_for(
@@ -607,13 +600,13 @@ class EvaluationGenerator:
         )
         continue
       yield event
-      # Emit a synthetic text event for each transcription, preserving
-      # the order in which events are received.
+      # Emit one synthetic text event per utterance, sourced from the
+      # connection's consolidated (non-partial) transcription.
       if (
           event.author != _USER_AUTHOR
           and event.output_transcription
           and event.output_transcription.text
-          and event.partial
+          and not event.partial
       ):
         yield Event(
             content=Content(
@@ -622,8 +615,15 @@ class EvaluationGenerator:
             ),
             author=agent_name,
             invocation_id=current_invocation_id,
-            custom_metadata={TRANSCRIPTION_CHUNK_METADATA_KEY: True},
         )
+      if event.custom_metadata and event.custom_metadata.get(
+          _FINAL_TURN_COMPLETE_METADATA_KEY
+      ):
+        saw_final_turn_complete = True
+      if event.output_transcription:
+        transcription_settled = not event.partial
+      if saw_final_turn_complete and transcription_settled:
+        break
 
   @staticmethod
   async def _generate_inferences_from_root_agent_live(

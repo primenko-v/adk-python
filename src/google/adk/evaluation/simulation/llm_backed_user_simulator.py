@@ -28,7 +28,6 @@ from ...models.registry import LLMRegistry
 from ...utils.context_utils import Aclosing
 from ...utils.feature_decorator import experimental
 from .._retry_options_utils import add_default_retry_options_if_not_present
-from ..constants import TRANSCRIPTION_CHUNK_METADATA_KEY
 from ..conversation_scenarios import ConversationScenario
 from ..evaluator import Evaluator
 from .llm_backed_user_simulator_prompts import get_llm_backed_user_simulator_prompt
@@ -153,43 +152,23 @@ class LlmBackedUserSimulator(UserSimulator):
       The summarized conversation history as a string.
     """
     rewritten_dialogue = []
-    # Author of the last dialogue line, if that line came from a live-API
-    # transcription chunk. Live mode emits one synthetic text event per
-    # transcription fragment, so consecutive chunks from the same author are
-    # one utterance and get merged back into a single line.
-    prev_chunk_author = None
     for e in events:
       if not e.content or not e.content.parts:
         continue
       author = e.author
-      is_transcription_chunk = bool(
-          e.custom_metadata
-          and e.custom_metadata.get(TRANSCRIPTION_CHUNK_METADATA_KEY)
-      )
       for part in e.content.parts:
         if part.text and not part.thought:
-          if is_transcription_chunk and author == prev_chunk_author:
-            # Chunks carry their own leading whitespace.
-            rewritten_dialogue[-1] += part.text
-          else:
-            rewritten_dialogue.append(f"{author}: {part.text}")
-          prev_chunk_author = author if is_transcription_chunk else None
-        elif part.function_call:
-          if include_function_calls:
-            rewritten_dialogue.append(
-                f"{author} called tool '{part.function_call.name}' with args:"
-                f" {part.function_call.args}"
-            )
-          # A tool call ends the current utterance even when it isn't
-          # rendered; chunks on either side of it are separate utterances.
-          prev_chunk_author = None
-        elif part.function_response:
-          if include_function_calls:
-            rewritten_dialogue.append(
-                f"Tool '{part.function_response.name}' returned:"
-                f" {part.function_response.response}"
-            )
-          prev_chunk_author = None
+          rewritten_dialogue.append(f"{author}: {part.text}")
+        elif include_function_calls and part.function_call:
+          rewritten_dialogue.append(
+              f"{author} called tool '{part.function_call.name}' with args:"
+              f" {part.function_call.args}"
+          )
+        elif include_function_calls and part.function_response:
+          rewritten_dialogue.append(
+              f"Tool '{part.function_response.name}' returned:"
+              f" {part.function_response.response}"
+          )
 
     return "\n\n".join(rewritten_dialogue)
 
