@@ -15,12 +15,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from google.adk.evaluation.app_details import AgentDetails
 from google.adk.evaluation.app_details import AppDetails
+from google.adk.evaluation.eval_case import EvalCase
+from google.adk.evaluation.eval_set import EvalSet
 from google.adk.evaluation.evaluation_generator import _LiveSession
+from google.adk.evaluation.evaluation_generator import _record_live_turn_telemetry
 from google.adk.evaluation.evaluation_generator import EvaluationGenerator
 from google.adk.evaluation.request_intercepter_plugin import _RequestIntercepterPlugin
+from google.adk.evaluation.simulation.llm_backed_user_simulator import LlmBackedUserSimulatorConfig
 from google.adk.evaluation.simulation.user_simulator import NextUserMessage
 from google.adk.evaluation.simulation.user_simulator import Status as UserSimulatorStatus
 from google.adk.evaluation.simulation.user_simulator import UserSimulator
@@ -463,13 +468,21 @@ class TestGenerateInferencesForSingleUserInvocationLive:
     user_content = types.Content(parts=[types.Part(text="User query")])
     invocation_id = "inv1"
 
-    transcription = types.Transcription(text="Partial transcription")
     partial_event = Event(
         author="agent",
         content=types.Content(parts=[]),
         invocation_id=invocation_id,
-        output_transcription=transcription,
+        output_transcription=types.Transcription(text="Partial "),
         partial=True,
+    )
+    consolidated_event = Event(
+        author="agent",
+        content=types.Content(parts=[]),
+        invocation_id=invocation_id,
+        output_transcription=types.Transcription(
+            text="Partial transcription", finished=True
+        ),
+        partial=False,
     )
 
     gen = EvaluationGenerator._generate_inferences_for_single_user_invocation_live(
@@ -491,23 +504,133 @@ class TestGenerateInferencesForSingleUserInvocationLive:
     # Mock turn_complete_event.wait to avoid blocking
     turn_complete_event.wait = mocker.AsyncMock()
 
-    # Put the partial event in the queue
     await event_queue.put(partial_event)
+    await event_queue.put(consolidated_event)
 
-    # Now advance
+    # Partial events are passed through without a synthetic companion.
     second_event = await gen.__anext__()
     assert second_event == partial_event
 
-    # Next should be the synthetic event
     third_event = await gen.__anext__()
-    assert third_event.author == "custom_agent_name"
-    assert third_event.invocation_id == invocation_id
-    assert third_event.content.role == "model"
-    assert third_event.content.parts[0].text == "Partial transcription"
+    assert third_event == consolidated_event
+
+    # The consolidated transcription yields one synthetic text event.
+    fourth_event = await gen.__anext__()
+    assert fourth_event.author == "custom_agent_name"
+    assert fourth_event.invocation_id == invocation_id
+    assert fourth_event.content.role == "model"
+    assert fourth_event.content.parts[0].text == "Partial transcription"
 
     # The generator should be exhausted now
     with pytest.raises(StopAsyncIteration):
       await gen.__anext__()
+
+  @pytest.mark.asyncio
+  async def test_generate_inferences_live_waits_for_transcription_tail(
+      self, mocker
+  ):
+    """The drain captures an ASR tail that trails turn_complete by ~1s."""
+    mock_live_request_queue = mocker.MagicMock()
+    event_queue = asyncio.Queue()
+    turn_complete_event = asyncio.Event()
+    invocation_id = "inv1"
+
+    flushed_fragment = Event(
+        author="agent",
+        invocation_id=invocation_id,
+        partial=False,
+        output_transcription=types.Transcription(
+            text="I can provide weather for", finished=True
+        ),
+    )
+    tail_chunk = Event(
+        author="agent",
+        invocation_id=invocation_id,
+        partial=True,
+        output_transcription=types.Transcription(
+            text=" London and Berlin.", finished=False
+        ),
+    )
+
+    await event_queue.put(flushed_fragment)
+    turn_complete_event.set()
+
+    async def put_tail_late():
+      await asyncio.sleep(0.8)
+      await event_queue.put(tail_chunk)
+
+    tail_task = asyncio.create_task(put_tail_late())
+
+    gen = EvaluationGenerator._generate_inferences_for_single_user_invocation_live(
+        live_request_queue=mock_live_request_queue,
+        event_queue=event_queue,
+        user_message=types.Content(parts=[types.Part(text="Which cities?")]),
+        current_invocation_id=invocation_id,
+        turn_complete_event=turn_complete_event,
+        live_timeout_seconds=300,
+    )
+
+    async def collect():
+      return [event async for event in gen]
+
+    events = await collect()
+    await tail_task
+
+    assert tail_chunk in events
+
+  @pytest.mark.asyncio
+  async def test_generate_inferences_live_stops_without_idle_wait(self, mocker):
+    """A server-sent finished + final turn_complete ends the drain at once."""
+    mock_live_request_queue = mocker.MagicMock()
+    event_queue = asyncio.Queue()
+    turn_complete_event = asyncio.Event()
+    invocation_id = "inv1"
+
+    chunk = Event(
+        author="agent",
+        invocation_id=invocation_id,
+        partial=True,
+        output_transcription=types.Transcription(
+            text="It is sunny.", finished=False
+        ),
+    )
+    server_finished = Event(
+        author="agent",
+        invocation_id=invocation_id,
+        partial=False,
+        output_transcription=types.Transcription(
+            text="It is sunny.", finished=True
+        ),
+    )
+    final_turn_complete = Event(
+        author="agent",
+        invocation_id=invocation_id,
+        turn_complete=True,
+        custom_metadata={"final_turn_complete": True},
+    )
+
+    await event_queue.put(chunk)
+    await event_queue.put(server_finished)
+    await event_queue.put(final_turn_complete)
+    turn_complete_event.set()
+
+    gen = EvaluationGenerator._generate_inferences_for_single_user_invocation_live(
+        live_request_queue=mock_live_request_queue,
+        event_queue=event_queue,
+        user_message=types.Content(parts=[types.Part(text="Weather?")]),
+        current_invocation_id=invocation_id,
+        turn_complete_event=turn_complete_event,
+        live_timeout_seconds=300,
+    )
+
+    async def collect():
+      return [event async for event in gen]
+
+    # Must finish well under the grace window — no idle wait.
+    events = await asyncio.wait_for(collect(), timeout=1.0)
+
+    assert server_finished in events
+    assert final_turn_complete in events
 
 
 @pytest.fixture
@@ -713,7 +836,7 @@ class TestLiveSessionCallbacks:
     mock_flow._preprocess_async = mock_preprocess_async
     mock_agent._llm_flow = mock_flow
 
-    # Mock run_live stream yielding one event
+    # Mock the _run_live_impl stream (bypassing run_live) yielding one event
     mock_event = Event(
         author="agent",
         content=types.Content(parts=[types.Part(text="Hello")]),
@@ -723,7 +846,10 @@ class TestLiveSessionCallbacks:
     async def mock_run_live(*args, **kwargs):
       yield mock_event
 
-    mock_agent.run_live.return_value = mock_run_live()
+    mock_agent._run_live_impl.return_value = mock_run_live()
+    mock_agent._handle_before_agent_callback = mocker.AsyncMock(
+        return_value=None
+    )
 
     # Mock plugin_manager on invocation context
     mock_plugin_manager = mocker.MagicMock()
@@ -733,6 +859,9 @@ class TestLiveSessionCallbacks:
         mock_plugin_manager
     )
     mock_runner._new_invocation_context_for_live.return_value.agent = mock_agent
+    mock_runner._new_invocation_context_for_live.return_value.end_invocation = (
+        False
+    )
 
     # 2. Instantiate and enter _LiveSession
     live_session = _LiveSession(
@@ -803,7 +932,7 @@ class TestLiveSessionCallbacks:
     mock_flow._preprocess_async = mock_preprocess_async
     mock_agent._llm_flow = mock_flow
 
-    # Mock run_live stream yielding one event
+    # Mock the _run_live_impl stream (bypassing run_live) yielding one event
     mock_event = Event(
         author="agent",
         content=types.Content(parts=[types.Part(text="Hello")]),
@@ -813,7 +942,10 @@ class TestLiveSessionCallbacks:
     async def mock_run_live(*args, **kwargs):
       yield mock_event
 
-    mock_agent.run_live.return_value = mock_run_live()
+    mock_agent._run_live_impl.return_value = mock_run_live()
+    mock_agent._handle_before_agent_callback = mocker.AsyncMock(
+        return_value=None
+    )
 
     # Mock plugin_manager on invocation context
     mock_plugin_manager = mocker.MagicMock()
@@ -823,6 +955,9 @@ class TestLiveSessionCallbacks:
         mock_plugin_manager
     )
     mock_runner._new_invocation_context_for_live.return_value.agent = mock_agent
+    mock_runner._new_invocation_context_for_live.return_value.end_invocation = (
+        False
+    )
 
     # 2. Instantiate and enter _LiveSession
     live_session = _LiveSession(
@@ -860,3 +995,400 @@ class TestLiveSessionCallbacks:
     )
     assert isinstance(called_after_args.kwargs["llm_response"], Event)
     assert called_after_args.kwargs["llm_response"] == mock_event
+
+
+class TestLiveSessionFunctionResponses:
+  """_LiveSession must not re-send tool responses to the live model."""
+
+  @pytest.mark.asyncio
+  async def test_consume_events_does_not_resend_function_responses(
+      self, mocker
+  ):
+    """The flow's run_live already forwards tool responses to the model.
+
+    Forwarding them again from _consume_events makes the model receive the
+    tool result twice and answer the same question twice.
+    """
+    from google.adk.agents.llm_agent import Agent
+
+    mock_runner = mocker.MagicMock()
+    mock_runner.session_service.append_event = mocker.AsyncMock()
+    mock_agent = mocker.MagicMock(spec=Agent)
+    mock_runner.agent = mock_agent
+    mock_runner._find_agent_to_run.return_value = mock_agent
+    mock_agent.name = "test_agent"
+
+    async def mock_preprocess_async(invocation_context, llm_request):
+      return
+      yield
+
+    mock_flow = mocker.MagicMock()
+    mock_flow._preprocess_async = mock_preprocess_async
+    mock_agent._llm_flow = mock_flow
+    mock_agent._handle_before_agent_callback = mocker.AsyncMock(
+        return_value=None
+    )
+
+    function_response_event = Event(
+        author="agent",
+        invocation_id="inv1",
+        content=types.Content(
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="get_temperature", response={"temp": 8.5}
+                    )
+                )
+            ]
+        ),
+    )
+
+    async def mock_run_live(*args, **kwargs):
+      yield function_response_event
+
+    mock_agent._run_live_impl.return_value = mock_run_live()
+    mock_plugin_manager = mocker.MagicMock()
+    mock_plugin_manager.run_before_model_callback = mocker.AsyncMock()
+    mock_plugin_manager.run_after_model_callback = mocker.AsyncMock()
+    mock_runner._new_invocation_context_for_live.return_value.plugin_manager = (
+        mock_plugin_manager
+    )
+    mock_runner._new_invocation_context_for_live.return_value.agent = mock_agent
+    mock_runner._new_invocation_context_for_live.return_value.end_invocation = (
+        False
+    )
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="test_user",
+        session_id="test_session",
+    )
+    send_content = mocker.patch.object(
+        live_session.live_request_queue, "send_content"
+    )
+
+    await live_session._consume_events()
+
+    send_content.assert_not_called()
+
+  @pytest.mark.asyncio
+  async def test_consume_events_tags_only_final_turn_complete(self, mocker):
+    """The post-tool turn_complete gets tagged; the intermediate one not."""
+    from google.adk.agents.llm_agent import Agent
+
+    mock_runner = mocker.MagicMock()
+    mock_runner.session_service.append_event = mocker.AsyncMock()
+    mock_agent = mocker.MagicMock(spec=Agent)
+    mock_runner.agent = mock_agent
+    mock_runner._find_agent_to_run.return_value = mock_agent
+    mock_agent.name = "test_agent"
+
+    async def mock_preprocess_async(invocation_context, llm_request):
+      return
+      yield
+
+    mock_flow = mocker.MagicMock()
+    mock_flow._preprocess_async = mock_preprocess_async
+    mock_agent._llm_flow = mock_flow
+    mock_agent._handle_before_agent_callback = mocker.AsyncMock(
+        return_value=None
+    )
+
+    function_call_event = Event(
+        author="agent",
+        invocation_id="inv1",
+        content=types.Content(
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="get_temperature", args={}
+                    )
+                )
+            ]
+        ),
+    )
+    intermediate_turn_complete = Event(
+        author="agent", invocation_id="inv1", turn_complete=True
+    )
+    final_turn_complete = Event(
+        author="agent", invocation_id="inv1", turn_complete=True
+    )
+
+    async def mock_run_live(*args, **kwargs):
+      yield function_call_event
+      yield intermediate_turn_complete
+      yield final_turn_complete
+
+    mock_agent._run_live_impl.return_value = mock_run_live()
+    mock_plugin_manager = mocker.MagicMock()
+    mock_plugin_manager.run_before_model_callback = mocker.AsyncMock()
+    mock_plugin_manager.run_after_model_callback = mocker.AsyncMock()
+    mock_runner._new_invocation_context_for_live.return_value.plugin_manager = (
+        mock_plugin_manager
+    )
+    mock_runner._new_invocation_context_for_live.return_value.agent = mock_agent
+    mock_runner._new_invocation_context_for_live.return_value.end_invocation = (
+        False
+    )
+
+    live_session = _LiveSession(
+        runner=mock_runner,
+        session=mocker.MagicMock(),
+        user_id="test_user",
+        session_id="test_session",
+    )
+
+    await live_session._consume_events()
+
+    assert not (intermediate_turn_complete.custom_metadata or {}).get(
+        "final_turn_complete"
+    )
+    assert final_turn_complete.custom_metadata == {"final_turn_complete": True}
+
+
+class TestRecordLiveTurnTelemetry:
+  """Test cases for _record_live_turn_telemetry."""
+
+  def test_record_live_turn_telemetry_splits_utterances_at_tool_calls(
+      self, mocker
+  ):
+    """Speech before and after a tool call is recorded in real order."""
+    span = mocker.MagicMock()
+    events = [
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            partial=False,
+            output_transcription=types.Transcription(
+                text="Let me check", finished=True
+            ),
+            timestamp=1.0,
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            content=types.Content(
+                parts=[
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="get_temperature", args={"city": "berlin"}
+                        )
+                    )
+                ]
+            ),
+            timestamp=2.0,
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            content=types.Content(
+                parts=[
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name="get_temperature", response={"temp": 8.5}
+                        )
+                    )
+                ]
+            ),
+            timestamp=3.0,
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            partial=False,
+            output_transcription=types.Transcription(
+                text="The temperature in Berlin is 8.5 degrees Celsius.",
+                finished=True,
+            ),
+            timestamp=4.0,
+        ),
+    ]
+
+    _record_live_turn_telemetry(
+        span,
+        events,
+        "inv1",
+        types.Content(
+            parts=[types.Part(text="What's the temperature in Berlin?")]
+        ),
+    )
+
+    span_event_names = [c.args[0] for c in span.add_event.call_args_list]
+    assert span_event_names == [
+        "model_utterance",
+        "tool_call",
+        "tool_response",
+        "model_utterance",
+    ]
+
+    attributes = {
+        c.args[0]: c.args[1] for c in span.set_attribute.call_args_list
+    }
+    assert json.loads(attributes["gcp.vertex.agent.llm_response"]) == {
+        "content": {
+            "role": "model",
+            "parts": [
+                {"text": "Let me check"},
+                {"text": "The temperature in Berlin is 8.5 degrees Celsius."},
+            ],
+        },
+    }
+
+  def test_record_live_turn_telemetry_ignores_audio_and_partial_events(
+      self, mocker
+  ):
+    """Only consolidated transcriptions produce utterances."""
+    span = mocker.MagicMock()
+    events = [
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            partial=True,
+            output_transcription=types.Transcription(text="It is"),
+            timestamp=1.0,
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            content=types.Content(
+                parts=[
+                    types.Part(
+                        inline_data=types.Blob(
+                            data=b"pcm", mime_type="audio/pcm"
+                        )
+                    )
+                ]
+            ),
+            timestamp=1.5,
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            partial=False,
+            output_transcription=types.Transcription(
+                text="It is sunny.", finished=True
+            ),
+            timestamp=2.0,
+        ),
+    ]
+
+    _record_live_turn_telemetry(span, events, "inv1", None)
+
+    span_event_names = [c.args[0] for c in span.add_event.call_args_list]
+    assert span_event_names == ["model_utterance"]
+    assert (
+        span.add_event.call_args_list[0].kwargs["attributes"]["text"]
+        == "It is sunny."
+    )
+
+  def test_record_live_turn_telemetry_aggregates_token_usage(self, mocker):
+    """Usage metadata from all of the turn's events is summed onto the span."""
+    span = mocker.MagicMock()
+    events = [
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            usage_metadata=types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=100,
+                candidates_token_count=20,
+            ),
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            usage_metadata=types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=150,
+                candidates_token_count=30,
+                thoughts_token_count=5,
+                cached_content_token_count=10,
+            ),
+        ),
+    ]
+
+    _record_live_turn_telemetry(span, events, "inv1", None)
+
+    span.set_attributes.assert_called_once_with({
+        "gen_ai.usage.input_tokens": 250,
+        "gen_ai.usage.output_tokens": 55,
+        "gen_ai.usage.cache_read.input_tokens": 10,
+        "gen_ai.usage.reasoning.output_tokens": 5,
+    })
+
+  def test_record_live_turn_telemetry_ignores_other_invocations(self, mocker):
+    """Events from other invocations do not leak into the turn's telemetry."""
+    span = mocker.MagicMock()
+    events = [
+        Event(
+            author="agent",
+            invocation_id="other_inv",
+            partial=False,
+            output_transcription=types.Transcription(
+                text="Old turn text.", finished=True
+            ),
+            timestamp=1.0,
+        ),
+        Event(
+            author="agent",
+            invocation_id="inv1",
+            partial=False,
+            output_transcription=types.Transcription(
+                text="New turn text.", finished=True
+            ),
+            timestamp=2.0,
+        ),
+    ]
+
+    _record_live_turn_telemetry(span, events, "inv1", None)
+
+    attributes = {
+        c.args[0]: c.args[1] for c in span.set_attribute.call_args_list
+    }
+    assert json.loads(attributes["gcp.vertex.agent.llm_response"]) == {
+        "content": {
+            "role": "model",
+            "parts": [{"text": "New turn text."}],
+        },
+    }
+
+
+class TestGenerateResponses:
+  """Test cases for EvaluationGenerator.generate_responses method."""
+
+  @pytest.mark.asyncio
+  async def test_generate_responses_forwards_llm_backed_user_simulator_config(
+      self, mocker
+  ):
+    """Tests that an LlmBackedUserSimulatorConfig is forwarded to the provider verbatim."""
+    mock_provider_cls = mocker.patch(
+        "google.adk.evaluation.evaluation_generator.UserSimulatorProvider"
+    )
+    mocker.patch(
+        "google.adk.evaluation.evaluation_generator.EvaluationGenerator._process_query",
+        new_callable=mocker.AsyncMock,
+        return_value=[],
+    )
+
+    user_simulator_config = LlmBackedUserSimulatorConfig(
+        model="test-model",
+        max_allowed_invocations=5,
+    )
+    eval_set = EvalSet(
+        eval_set_id="test_set",
+        eval_cases=[EvalCase(eval_id="case_0", conversation=[])],
+    )
+
+    await EvaluationGenerator.generate_responses(
+        eval_set=eval_set,
+        agent_module_path="some.agent.module",
+        repeat_num=1,
+        user_simulator_config=user_simulator_config,
+    )
+
+    mock_provider_cls.assert_called_once_with(
+        user_simulator_config=user_simulator_config
+    )
+    assert (
+        mock_provider_cls.call_args.kwargs["user_simulator_config"]
+        is user_simulator_config
+    )

@@ -389,6 +389,10 @@ class GeminiLlmConnection(BaseLlmConnection):
                   live_session_id=live_session_id,
               )
             if message.server_content.output_transcription.finished:
+              logger.info(
+                  'live-transcription: finished=True SERVER-SENT, text=%r',
+                  self._output_transcription_text,
+              )
               yield LlmResponse(
                   output_transcription=types.Transcription(
                       text=self._output_transcription_text,
@@ -419,6 +423,15 @@ class GeminiLlmConnection(BaseLlmConnection):
               )
               self._input_transcription_text = ''
             if self._output_transcription_text:
+              logger.info(
+                  'live-transcription: finished=True FABRICATED'
+                  ' (interrupted=%s turn_complete=%s generation_complete=%s),'
+                  ' text=%r',
+                  message.server_content.interrupted,
+                  message.server_content.turn_complete,
+                  message.server_content.generation_complete,
+                  self._output_transcription_text,
+              )
               yield LlmResponse(
                   output_transcription=types.Transcription(
                       text=self._output_transcription_text,

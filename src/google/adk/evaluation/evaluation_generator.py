@@ -17,7 +17,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import importlib
+import json
 import logging
+import time
 from typing import Any
 from typing import AsyncGenerator
 from typing import Optional
@@ -26,12 +28,14 @@ import uuid
 from google.genai import errors
 from google.genai import types
 from google.genai.types import Content
+import opentelemetry.context as context_api
+from opentelemetry.trace import set_span_in_context
+from opentelemetry.trace import Span
 from pydantic import BaseModel
 from websockets.exceptions import ConnectionClosed
 from websockets.exceptions import ConnectionClosedOK
 
 from ..agents.callback_context import CallbackContext
-from ..agents.invocation_context import InvocationContext
 from ..agents.live_request_queue import LiveRequestQueue
 from ..agents.llm_agent import Agent
 from ..agents.run_config import RunConfig
@@ -39,7 +43,6 @@ from ..agents.run_config import StreamingMode
 from ..artifacts.base_artifact_service import BaseArtifactService
 from ..artifacts.in_memory_artifact_service import InMemoryArtifactService
 from ..events.event import Event
-from ..flows.llm_flows.functions import handle_function_calls_live
 from ..memory.base_memory_service import BaseMemoryService
 from ..memory.in_memory_memory_service import InMemoryMemoryService
 from ..models.llm_request import LlmRequest
@@ -47,6 +50,8 @@ from ..runners import Runner
 from ..sessions.base_session_service import BaseSessionService
 from ..sessions.in_memory_session_service import InMemorySessionService
 from ..sessions.session import Session
+from ..telemetry import tracing as _telemetry
+from ..telemetry._token_usage import TokenUsage
 from ..utils.context_utils import Aclosing
 from ._retry_options_utils import EnsureRetryOptionsPlugin
 from .app_details import AgentDetails
@@ -59,6 +64,7 @@ from .eval_case import InvocationEvents
 from .eval_case import SessionInput
 from .eval_set import EvalSet
 from .request_intercepter_plugin import _RequestIntercepterPlugin
+from .simulation.user_simulator import BaseUserSimulatorConfig
 from .simulation.user_simulator import Status as UserSimulatorStatus
 from .simulation.user_simulator import UserSimulator
 from .simulation.user_simulator_provider import UserSimulatorProvider
@@ -67,6 +73,121 @@ logger = logging.getLogger("google_adk." + __name__)
 
 _USER_AUTHOR = "user"
 _DEFAULT_AUTHOR = "agent"
+
+# Fallback idle window for draining a turn's events when no finished=True
+# transcription arrives. Each received event resets the window.
+_TRANSCRIPTION_TAIL_GRACE_SECONDS = 2.0
+
+# `Event.custom_metadata` key marking the turn-final `turn_complete` (as
+# opposed to the intermediate one emitted when the model issues a tool call).
+_FINAL_TURN_COMPLETE_METADATA_KEY = "final_turn_complete"
+
+
+def _extract_content_text(content: Optional[Content]) -> Optional[str]:
+  """Joins the text parts of a `Content` into a single string, or None."""
+  if not content or not content.parts:
+    return None
+  text = " ".join(p.text for p in content.parts if p.text)
+  return text or None
+
+
+def _record_live_turn_telemetry(
+    span: Span,
+    events: list[Event],
+    invocation_id: str,
+    user_message: Optional[Content],
+) -> None:
+  """Records the turn's request/response and chronology on a `live_turn` span.
+
+  Utterances are the connection's consolidated (non-partial) transcriptions,
+  one per speech segment between tool calls. `llm_response` carries one part
+  per utterance, and each utterance / tool call / tool response is also
+  recorded as a timestamped span event. Token usage reported by the live API
+  (one `usage_metadata` event per generation) is summed onto the span using
+  the same `gen_ai.usage.*` attributes as non-live `call_llm` spans.
+  """
+  user_text = _extract_content_text(user_message)
+  if user_text:
+    span.set_attribute(
+        "gcp.vertex.agent.llm_request",
+        json.dumps({
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": user_text}],
+            }],
+        }),
+    )
+
+  utterances: list[str] = []
+  usage_metadatas: list[types.GenerateContentResponseUsageMetadata] = []
+
+  for evt in events:
+    if evt.invocation_id != invocation_id or evt.author == _USER_AUTHOR:
+      continue
+    if evt.usage_metadata:
+      usage_metadatas.append(evt.usage_metadata)
+    if evt.get_function_calls():
+      for call in evt.get_function_calls():
+        span.add_event(
+            "tool_call",
+            attributes={
+                "tool": call.name or "",
+                "args": json.dumps(call.args, default=str),
+            },
+            timestamp=int(evt.timestamp * 1e9),
+        )
+    elif evt.get_function_responses():
+      for response in evt.get_function_responses():
+        span.add_event(
+            "tool_response",
+            attributes={
+                "tool": response.name or "",
+                "response": json.dumps(response.response, default=str),
+            },
+            timestamp=int(evt.timestamp * 1e9),
+        )
+    elif (
+        evt.output_transcription
+        and evt.output_transcription.text
+        and not evt.partial
+    ):
+      utterances.append(evt.output_transcription.text)
+      span.add_event(
+          "model_utterance",
+          attributes={"text": evt.output_transcription.text},
+          timestamp=int(evt.timestamp * 1e9),
+      )
+
+  if usage_metadatas:
+
+    def _sum_tokens(field: str) -> Optional[int]:
+      values = [
+          getattr(usage, field)
+          for usage in usage_metadatas
+          if getattr(usage, field) is not None
+      ]
+      return sum(values) if values else None
+
+    aggregated_usage = types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=_sum_tokens("prompt_token_count"),
+        candidates_token_count=_sum_tokens("candidates_token_count"),
+        thoughts_token_count=_sum_tokens("thoughts_token_count"),
+        tool_use_prompt_token_count=_sum_tokens("tool_use_prompt_token_count"),
+        cached_content_token_count=_sum_tokens("cached_content_token_count"),
+        total_token_count=_sum_tokens("total_token_count"),
+    )
+    span.set_attributes(TokenUsage(aggregated_usage).to_attributes())
+
+  if utterances:
+    span.set_attribute(
+        "gcp.vertex.agent.llm_response",
+        json.dumps({
+            "content": {
+                "role": "model",
+                "parts": [{"text": text} for text in utterances],
+            },
+        }),
+    )
 
 
 class EvalCaseResponses(BaseModel):
@@ -99,6 +220,13 @@ class _LiveSession:
     self.live_finished = asyncio.Event()
     self.current_invocation_id = Event.new_id()
     self.consume_task = None
+    # OTel context whose current span is the per-turn `live_turn`. Set by
+    # the main task before sending a user message and cleared after the
+    # turn completes. The consume task attaches it around
+    # `handle_function_calls_live` so tool spans are parented under
+    # `live_turn` (i.e. live in the same trace as their turn) instead of
+    # under whatever ambient context this task happens to have.
+    self.current_turn_context: Optional[context_api.Context] = None
 
   async def __aenter__(self) -> _LiveSession:
     """Starts the background task."""
@@ -124,6 +252,25 @@ class _LiveSession:
           self.session, self.runner.agent
       )
 
+      # Run before_agent_callback before any instruction preprocessing.
+      # `agent.run_live` (bypassed below) would normally fire this. Without it,
+      # an agent that seeds session state in before_agent_callback raises
+      # KeyError when `_preprocess_async` renders a `{state_var}` referenced by
+      # its instruction template. The callback writes through to
+      # `session.state` (State.__setitem__), and we append the resulting event
+      # so the state delta is persisted for non-in-memory session services too.
+      before_agent_event = (
+          await invocation_context.agent._handle_before_agent_callback(
+              invocation_context
+          )
+      )
+      if before_agent_event:
+        await self.runner.session_service.append_event(
+            session=self.session, event=before_agent_event
+        )
+      if invocation_context.end_invocation:
+        return
+
       callback_context = None
       llm_request = LlmRequest()
 
@@ -146,82 +293,85 @@ class _LiveSession:
       )
 
       in_function_call_loop = False
+      # Bypass `agent.run_live`: it wraps the flow in `record_agent_invocation`
+      # which opens a single long-lived `invoke_agent` span covering the
+      # entire session. That collapses every turn into one trace and adds an
+      # empty/erroring trace to session views (the WebSocket close at
+      # session-end gets recorded as a span exception). Call the impl
+      # directly; per-turn `live_turn` spans (opened by the main task) take
+      # over the role of session-grouped invocation spans for eval purposes.
+      # `before_agent_callback` is run explicitly above (it must fire before
+      # `_preprocess_async`, and `run_live` would fire it a second time);
+      # `after_agent_callback` is still skipped here — fine for evals of
+      # agents that don't rely on it.
       async with Aclosing(
-          invocation_context.agent.run_live(invocation_context)
+          invocation_context.agent._run_live_impl(invocation_context)
       ) as agen:
-        async for event in agen:
-          assert event is not None
-          event.invocation_id = self.current_invocation_id
-          if callback_context:
-            await invocation_context.plugin_manager.run_after_model_callback(
-                callback_context=callback_context,
-                llm_response=event,
-            )
-          await self.event_queue.put(event)
-          if not event.partial:
-            await self.runner.session_service.append_event(
-                session=self.session, event=event
-            )
-          function_calls = event.get_function_calls()
-          if function_calls:
-            in_function_call_loop = True
-            inv_context = InvocationContext(
-                session_service=self.runner.session_service,
-                invocation_id=event.invocation_id,
-                agent=self.runner.agent,
-                session=self.session,
-                run_config=run_config,
-            )
-
-            if isinstance(self.runner.agent, Agent):
-              resolved_tools = await self.runner.agent.canonical_tools(
-                  inv_context
-              )
-              tools_dict = {t.name: t for t in resolved_tools}
-            else:
-              tools_dict = {}
-
+        # Drive the generator manually so we can attach
+        # `current_turn_context` around BOTH the generator's internal work
+        # (which also runs `handle_function_calls_live` — see
+        # base_llm_flow.py:_receive_from_model) and our own body below.
+        # Without this, the first invocation of the tool — the one inside
+        # `_run_live_impl` — runs without `live_turn` as parent and lands
+        # as an orphan root span.
+        while True:
+          token = (
+              context_api.attach(self.current_turn_context)
+              if self.current_turn_context is not None
+              else None
+          )
+          try:
             try:
-              response_event = await handle_function_calls_live(
-                  invocation_context=inv_context,
-                  function_call_event=event,
-                  tools_dict=tools_dict,
+              event = await agen.__anext__()
+            except StopAsyncIteration:
+              break
+            assert event is not None
+            event.invocation_id = self.current_invocation_id
+            if callback_context:
+              await invocation_context.plugin_manager.run_after_model_callback(
+                  callback_context=callback_context,
+                  llm_response=event,
               )
+            # Tag the turn-final `turn_complete` before queueing so the
+            # drain can recognize the end of the turn.
+            if (
+                event.turn_complete
+                and event.author != _USER_AUTHOR
+                and not in_function_call_loop
+            ):
+              event.custom_metadata = {
+                  **(event.custom_metadata or {}),
+                  _FINAL_TURN_COMPLETE_METADATA_KEY: True,
+              }
+            await self.event_queue.put(event)
+            if not event.partial:
+              await self.runner.session_service.append_event(
+                  session=self.session, event=event
+              )
+            # Track the "function-call → tool-response → final answer"
+            # interlude so the first `turn_complete` (which signals "I've
+            # issued my tool call") doesn't release the main task — the
+            # turn isn't really done until the post-tool reply arrives.
+            if event.get_function_calls():
+              in_function_call_loop = True
 
-              if (
-                  response_event
-                  and response_event.content
-                  and response_event.content.parts
-              ):
-                for part in response_event.content.parts:
-                  if part.function_response:
-                    tool_content = types.Content(
-                        role="tool",
-                        parts=[part],
-                    )
-                    self.live_request_queue.send_content(tool_content)
-            except (ValueError, RuntimeError, KeyError, TypeError) as e:
-              logger.error(
-                  "Failed to handle function calls: %s",
-                  e,
-                  exc_info=True,
-              )
-              for fc in function_calls:
-                response_content = types.FunctionResponse(
-                    name=fc.name,
-                    id=fc.id,
-                    response={"error": str(e)},
-                )
-                tool_content = types.Content(
-                    role="tool",
-                    parts=[types.Part(function_response=response_content)],
-                )
-                self.live_request_queue.send_content(tool_content)
-          if event.turn_complete and event.author != _USER_AUTHOR:
-            if not in_function_call_loop:
-              self.turn_complete_event.set()
-            else:
-              in_function_call_loop = False
+            # The flow handles the whole tool loop by itself:
+            # `_receive_from_model` runs `handle_function_calls_live` and
+            # yields the function_response event, and `run_live`
+            # (base_llm_flow.py, "send back the function response to
+            # models") forwards it into the live request queue. Executing
+            # the tool or forwarding the response here would do either a
+            # second time — the model would receive the tool result twice
+            # and answer the same question twice.
+
+            if event.turn_complete and event.author != _USER_AUTHOR:
+              if not in_function_call_loop:
+                self.turn_complete_event.set()
+              else:
+                in_function_call_loop = False
+          finally:
+            if token is not None:
+              context_api.detach(token)
     finally:
       self.live_finished.set()
       self.turn_complete_event.set()  # Unblock any waiters
@@ -263,6 +413,7 @@ class EvaluationGenerator:
       agent_module_path: str,
       repeat_num: int = 3,
       agent_name: str = None,
+      user_simulator_config: Optional[BaseUserSimulatorConfig] = None,
   ) -> list[EvalCaseResponses]:
     """Returns evaluation responses for the given dataset and agent.
 
@@ -273,12 +424,19 @@ class EvaluationGenerator:
         usually done to remove uncertainty that a single run may bring.
       agent_name: The name of the agent that should be evaluated. This is
         usually the sub-agent.
+      user_simulator_config: Optional configuration for the user simulator.
+        Only relevant for eval cases that use a `conversation_scenario` (which
+        are driven by `LlmBackedUserSimulator`); ignored for static
+        conversations. Pass an `LlmBackedUserSimulatorConfig` to override the
+        user-simulation model, max invocations, or custom instructions.
     """
     results = []
 
     for eval_case in eval_set.eval_cases:
-      # assume only static conversations are needed
-      user_simulator = UserSimulatorProvider().provide(eval_case)
+      user_simulator = UserSimulatorProvider(
+          user_simulator_config=user_simulator_config
+      ).provide(eval_case)
+
       responses = []
       for _ in range(repeat_num):
         response_invocations = await EvaluationGenerator._process_query(
@@ -322,6 +480,11 @@ class EvaluationGenerator:
     return results
 
   @staticmethod
+  def _is_live_api_model(name: str) -> bool:
+    """Detects Gemini Live API models by name (e.g. `gemini-live-...`)."""
+    return "live" in name
+
+  @staticmethod
   async def _process_query(
       module_name: str,
       user_simulator: UserSimulator,
@@ -340,12 +503,23 @@ class EvaluationGenerator:
       agent_to_evaluate = root_agent.find_agent(agent_name)
       assert agent_to_evaluate, f"Sub-Agent `{agent_name}` not found."
 
-    return await EvaluationGenerator._generate_inferences_from_root_agent(
-        agent_to_evaluate,
-        user_simulator=user_simulator,
-        reset_func=reset_func,
-        initial_session=initial_session,
-    )
+    if EvaluationGenerator._is_live_api_model(agent_to_evaluate.model):
+      return (
+          await EvaluationGenerator._generate_inferences_from_root_agent_live(
+              root_agent=agent_to_evaluate,
+              user_simulator=user_simulator,
+              reset_func=reset_func,
+              initial_session=initial_session,
+          )
+      )
+
+    else:
+      return await EvaluationGenerator._generate_inferences_from_root_agent(
+          agent_to_evaluate,
+          user_simulator=user_simulator,
+          reset_func=reset_func,
+          initial_session=initial_session,
+      )
 
   @staticmethod
   async def _generate_inferences_for_single_user_invocation(
@@ -405,26 +579,51 @@ class EvaluationGenerator:
       )
       raise
 
-    while not event_queue.empty():
-      event = await event_queue.get()
-      if event.invocation_id == current_invocation_id:
-        yield event
-        # Emit a synthetic text event for each transcription, preserving
-        # the order in which events are received.
-        if (
-            event.author != _USER_AUTHOR
-            and event.output_transcription
-            and event.output_transcription.text
-            and event.partial
-        ):
-          yield Event(
-              content=Content(
-                  role="model",
-                  parts=[types.Part(text=event.output_transcription.text)],
-              ),
-              author=agent_name,
-              invocation_id=current_invocation_id,
-          )
+    # `turn_complete` only ends generation; transcription can trail it by
+    # seconds. Stop once the turn-final `turn_complete` has been seen and
+    # the transcription closed with a finished=True consolidation (the
+    # common case — no idle wait); otherwise fall back to the grace window.
+    saw_final_turn_complete = False
+    transcription_settled = False
+    while True:
+      try:
+        event = await asyncio.wait_for(
+            event_queue.get(), timeout=_TRANSCRIPTION_TAIL_GRACE_SECONDS
+        )
+      except asyncio.TimeoutError:
+        break
+      if event.invocation_id != current_invocation_id:
+        logger.debug(
+            "Dropped straggler event from invocation %s while draining %s.",
+            event.invocation_id,
+            current_invocation_id,
+        )
+        continue
+      yield event
+      # Emit one synthetic text event per utterance, sourced from the
+      # connection's consolidated (non-partial) transcription.
+      if (
+          event.author != _USER_AUTHOR
+          and event.output_transcription
+          and event.output_transcription.text
+          and not event.partial
+      ):
+        yield Event(
+            content=Content(
+                role="model",
+                parts=[types.Part(text=event.output_transcription.text)],
+            ),
+            author=agent_name,
+            invocation_id=current_invocation_id,
+        )
+      if event.custom_metadata and event.custom_metadata.get(
+          _FINAL_TURN_COMPLETE_METADATA_KEY
+      ):
+        saw_final_turn_complete = True
+      if event.output_transcription:
+        transcription_settled = not event.partial
+      if saw_final_turn_complete and transcription_settled:
+        break
 
   @staticmethod
   async def _generate_inferences_from_root_agent_live(
@@ -503,18 +702,50 @@ class EvaluationGenerator:
 
             logger.info("Waiting for model to complete turn %d...", turn_idx)
 
-            async for (
-                event
-            ) in EvaluationGenerator._generate_inferences_for_single_user_invocation_live(
-                live_request_queue=live_session.live_request_queue,
-                event_queue=live_session.event_queue,
-                user_message=next_user_message.user_message,
-                current_invocation_id=live_session.current_invocation_id,
-                turn_complete_event=live_session.turn_complete_event,
-                live_timeout_seconds=live_timeout_seconds,
-                agent_name=runner.agent.name,
-            ):
-              events.append(event)
+            # Open a per-turn root span. By using an empty parent context it
+            # becomes the root of its own trace, which session-grouping
+            # tracing pipelines (e.g. MLflow Sessions) treat as one chat-turn
+            # entry. Tool calls executed during the turn are re-parented
+            # under this span by `_LiveSession._consume_events` via
+            # `current_turn_context`, so the whole turn lives in one trace.
+            live_turn_span = _telemetry.tracer.start_span(
+                "live_turn",
+                context=context_api.Context(),
+                start_time=time.time_ns(),
+            )
+            live_turn_span.set_attribute("gen_ai.conversation.id", session_id)
+            live_turn_span.set_attribute("gen_ai.agent.name", runner.agent.name)
+            live_turn_span.set_attribute("gen_ai.operation.name", "chat")
+            live_session.current_turn_context = set_span_in_context(
+                live_turn_span
+            )
+            try:
+              async for (
+                  event
+              ) in EvaluationGenerator._generate_inferences_for_single_user_invocation_live(
+                  live_request_queue=live_session.live_request_queue,
+                  event_queue=live_session.event_queue,
+                  user_message=next_user_message.user_message,
+                  current_invocation_id=live_session.current_invocation_id,
+                  turn_complete_event=live_session.turn_complete_event,
+                  live_timeout_seconds=live_timeout_seconds,
+                  agent_name=runner.agent.name,
+              ):
+                events.append(event)
+
+              # The synthetic text events for the eval trajectory are emitted
+              # per transcription chunk (in arrival order) by
+              # `_generate_inferences_for_single_user_invocation_live`; the
+              # span gets per-utterance attributes and timestamped events.
+              _record_live_turn_telemetry(
+                  live_turn_span,
+                  events,
+                  live_session.current_invocation_id,
+                  next_user_message.user_message,
+              )
+            finally:
+              live_session.current_turn_context = None
+              live_turn_span.end()
 
             if live_session.live_finished.is_set():
               logger.info("Live session finished signal detected.")
